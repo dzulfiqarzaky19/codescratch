@@ -1,0 +1,6 @@
+{
+  "name": "medium-repo",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/*"]
+}

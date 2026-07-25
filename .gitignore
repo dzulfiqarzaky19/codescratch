@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.codescratch/
+*.db
+*.db-*
+.env
+.DS_Store
+coverage/
+*.log
+# wasm copied by postinstall from tree-sitter-wasms — do not commit
+wasm/

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "codescratch": {
+      "command": "node",
+      "args": ["D:/dev/projects/codescratch/dist/mcp.js"],
+      "env": {
+        "CODESCRATCH_ROOT": "${workspaceFolder}"
+      }
+    }
+  }
+}
