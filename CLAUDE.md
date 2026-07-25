@@ -40,8 +40,8 @@ Optional `root` on every tool for monorepos (else `CODESCRATCH_ROOT` / cwd).
 - dynamic `import()` / `require()`
 - DI / proxies / reflection
 - object-literal methods only partial
-- `export *` not fully expanded
 - JSX component identity syntactic only
+
 
 
 ## Layout

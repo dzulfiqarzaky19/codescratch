@@ -190,12 +190,13 @@ export class GraphDb {
     module_path: string | null;
     is_type_only: boolean;
     is_namespace: boolean;
+    is_star_reexport?: boolean;
     line: number;
   }): void {
     this.db
       .prepare(
-        `INSERT INTO bindings(file_path, local_name, imported_name, module_specifier, module_path, is_type_only, is_namespace, line)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO bindings(file_path, local_name, imported_name, module_specifier, module_path, is_type_only, is_namespace, is_star_reexport, line)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         b.file_path,
@@ -205,6 +206,7 @@ export class GraphDb {
         b.module_path,
         b.is_type_only ? 1 : 0,
         b.is_namespace ? 1 : 0,
+        b.is_star_reexport ? 1 : 0,
         b.line,
       );
   }
@@ -219,7 +221,7 @@ export class GraphDb {
     return rows<DbBinding>(
       this.db
         .prepare(
-          `SELECT id, file_path, local_name, imported_name, module_specifier, module_path, is_type_only, is_namespace, line
+          `SELECT id, file_path, local_name, imported_name, module_specifier, module_path, is_type_only, is_namespace, is_star_reexport, line
            FROM bindings WHERE file_path = ?`,
         )
         .all(filePath),
@@ -230,10 +232,21 @@ export class GraphDb {
     return rows<DbBinding>(
       this.db
         .prepare(
-          `SELECT id, file_path, local_name, imported_name, module_specifier, module_path, is_type_only, is_namespace, line
+          `SELECT id, file_path, local_name, imported_name, module_specifier, module_path, is_type_only, is_namespace, is_star_reexport, line
            FROM bindings WHERE file_path = ? AND local_name = ?`,
         )
         .all(filePath, localName),
+    ).map(mapBinding);
+  }
+
+  starReexportsFrom(filePath: string): ImportBinding[] {
+    return rows<DbBinding>(
+      this.db
+        .prepare(
+          `SELECT id, file_path, local_name, imported_name, module_specifier, module_path, is_type_only, is_namespace, is_star_reexport, line
+           FROM bindings WHERE file_path = ? AND is_star_reexport = 1`,
+        )
+        .all(filePath),
     ).map(mapBinding);
   }
 
@@ -243,7 +256,7 @@ export class GraphDb {
       return rows<DbBinding>(
         this.db
           .prepare(
-            `SELECT id, file_path, local_name, imported_name, module_specifier, module_path, is_type_only, is_namespace, line
+            `SELECT id, file_path, local_name, imported_name, module_specifier, module_path, is_type_only, is_namespace, is_star_reexport, line
              FROM bindings WHERE module_path IS NULL AND file_path IN (${ph})`,
           )
           .all(...filePaths),
@@ -252,7 +265,7 @@ export class GraphDb {
     return rows<DbBinding>(
       this.db
         .prepare(
-          `SELECT id, file_path, local_name, imported_name, module_specifier, module_path, is_type_only, is_namespace, line
+          `SELECT id, file_path, local_name, imported_name, module_specifier, module_path, is_type_only, is_namespace, is_star_reexport, line
            FROM bindings WHERE module_path IS NULL`,
         )
         .all(),
@@ -540,12 +553,17 @@ function migrate(db: DatabaseSync): void {
         module_path      TEXT,
         is_type_only     INTEGER NOT NULL DEFAULT 0,
         is_namespace     INTEGER NOT NULL DEFAULT 0,
+        is_star_reexport INTEGER NOT NULL DEFAULT 0,
         line             INTEGER NOT NULL,
         FOREIGN KEY (file_path) REFERENCES files(path) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS idx_bindings_file ON bindings(file_path);
       CREATE INDEX IF NOT EXISTS idx_bindings_local ON bindings(file_path, local_name);
     `);
+  } else if (!columnExists(db, "bindings", "is_star_reexport")) {
+    db.exec(
+      `ALTER TABLE bindings ADD COLUMN is_star_reexport INTEGER NOT NULL DEFAULT 0`,
+    );
   }
   const ver = row<{ value: string }>(
     db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get(),
@@ -591,6 +609,7 @@ interface DbBinding {
   module_path: string | null;
   is_type_only: number;
   is_namespace: number;
+  is_star_reexport: number;
   line: number;
 }
 
@@ -632,6 +651,7 @@ function mapBinding(r: DbBinding): ImportBinding {
     module_path: r.module_path,
     is_type_only: !!r.is_type_only,
     is_namespace: !!r.is_namespace,
+    is_star_reexport: !!r.is_star_reexport,
     line: r.line,
   };
 }

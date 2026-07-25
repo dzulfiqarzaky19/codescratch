@@ -235,8 +235,15 @@ function walk(
       break;
     }
     case "export_statement": {
-      extractExport(node, symbols, refs, exportedNames, source, enclosing);
-      // also walk for nested decls
+      extractExport(
+        node,
+        symbols,
+        refs,
+        bindings,
+        exportedNames,
+        source,
+        enclosing,
+      );
       walkChildren(
         node,
         enclosing,
@@ -397,26 +404,101 @@ function extractExport(
   node: Node,
   symbols: ExtractedSymbol[],
   refs: ExtractedRef[],
+  bindings: ExtractedBinding[],
   exportedNames: Set<string>,
   source: string,
   enclosing: string | null,
 ): void {
-  const sourceNode = node.childForFieldName("source");
-  if (sourceNode && sourceNode.type === "string") {
-    const spec = stripQuotes(sourceNode.text);
+  const sourceNode =
+    node.childForFieldName("source") ??
+    namedChildren(node).find((c) => c.type === "string");
+  const fromSpec =
+    sourceNode && sourceNode.type === "string"
+      ? stripQuotes(sourceNode.text)
+      : null;
+  const line = node.startPosition.row + 1;
+
+  if (fromSpec) {
     refs.push({
       kind: "imports",
       srcQualifiedName: null,
-      rawName: spec,
-      targetHint: spec,
-      line: node.startPosition.row + 1,
+      rawName: fromSpec,
+      targetHint: fromSpec,
+      line,
     });
+  }
+
+  // export * from './mod'  |  export * as ns from './mod'
+  const text = node.text.replace(/\s+/g, " ");
+  const isStarReexport =
+    !!fromSpec &&
+    (/^export\s+\*\s+from\b/.test(text) ||
+      /^export\s+type\s+\*\s+from\b/.test(text) ||
+      namedChildren(node).some((c) => c.type === "namespace_export") ||
+      (node.children.some((c) => c?.type === "*") &&
+        !namedChildren(node).some((c) => c.type === "export_clause")));
+
+  if (isStarReexport && fromSpec) {
+    const nsExport = namedChildren(node).find(
+      (c) => c.type === "namespace_export",
+    );
+    if (nsExport) {
+      const ns =
+        nsExport.childForFieldName("name") ??
+        namedChildren(nsExport).find((x) => x.type === "identifier");
+      if (ns) {
+        bindings.push({
+          localName: ns.text,
+          importedName: "*",
+          moduleSpecifier: fromSpec,
+          isTypeOnly: text.includes("export type"),
+          isNamespace: true,
+          isStarReexport: false,
+          line,
+        });
+      }
+    } else {
+      bindings.push({
+        localName: "*",
+        importedName: "*",
+        moduleSpecifier: fromSpec,
+        isTypeOnly: /^export\s+type\s+\*/.test(text),
+        isNamespace: false,
+        isStarReexport: true,
+        line,
+      });
+    }
+  }
+
+  // export { a, b as c } from './mod'
+  if (fromSpec) {
+    for (const c of node.descendantsOfType("export_specifier")) {
+      if (!c) continue;
+      const nameNode =
+        c.childForFieldName("name") ??
+        namedChildren(c).find((x) => x.type === "identifier");
+      const aliasNode =
+        c.childForFieldName("alias") ??
+        namedChildren(c).filter((x) => x.type === "identifier")[1];
+      if (!nameNode) continue;
+      const importedName = nameNode.text;
+      const localName = aliasNode ? aliasNode.text : importedName;
+      bindings.push({
+        localName,
+        importedName,
+        moduleSpecifier: fromSpec,
+        isTypeOnly: false,
+        isNamespace: false,
+        isStarReexport: false,
+        line: c.startPosition.row + 1,
+      });
+      exportedNames.add(localName);
+    }
   }
 
   // export default function/class/expr
   const isDefault = node.children.some((c) => c?.type === "default");
   if (isDefault && !enclosing) {
-    // declaration with name
     for (const c of namedChildren(node)) {
       if (
         c.type === "function_declaration" ||
@@ -424,7 +506,6 @@ function extractExport(
         c.type === "abstract_class_declaration"
       ) {
         const name = childText(c, "name") ?? "default";
-        // also record as default
         if (name !== "default" && !symbols.some((s) => s.name === "default")) {
           symbols.push({
             kind: c.type.includes("class") ? "class" : "function",
@@ -463,11 +544,13 @@ function extractExport(
     }
   }
 
-  // export { foo as bar }
-  for (const c of node.descendantsOfType("export_specifier")) {
-    if (!c) continue;
-    const local = c.childForFieldName("name");
-    if (local) exportedNames.add(local.text);
+  // export { foo as bar } (local, no from)
+  if (!fromSpec) {
+    for (const c of node.descendantsOfType("export_specifier")) {
+      if (!c) continue;
+      const local = c.childForFieldName("name");
+      if (local) exportedNames.add(local.text);
+    }
   }
 }
 

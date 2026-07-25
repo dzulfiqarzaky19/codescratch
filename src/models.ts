@@ -56,6 +56,7 @@ export interface ImportBinding {
   module_path: string | null;
   is_type_only: boolean;
   is_namespace: boolean;
+  is_star_reexport: boolean;
   line: number;
 }
 
@@ -90,11 +91,13 @@ export interface ExtractedRef {
 
 export interface ExtractedBinding {
   localName: string;
-  /** export name in module, 'default', or '*' for namespace */
+  /** export name in module, 'default', or '*' for namespace / star-reexport */
   importedName: string;
   moduleSpecifier: string;
   isTypeOnly: boolean;
   isNamespace: boolean;
+  /** `export * from '…'` — all names forwarded from module */
+  isStarReexport?: boolean;
   line: number;
 }
 
@@ -138,7 +141,6 @@ export const EXTRACTOR_LIMITATIONS = [
   "dynamic import()/require() not modeled",
   "DI/proxies/reflection invisible",
   "object-literal methods only partial",
-  "re-exports `export *` not fully expanded",
   "JSX component identity is syntactic only",
 ] as const;
 
