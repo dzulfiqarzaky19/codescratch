@@ -1,14 +1,21 @@
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, cpSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  cpSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { indexRepo } from "../src/index/indexer.js";
-import { GraphDb } from "../src/db/client.js";
+import { GraphDb, nodeId } from "../src/db/client.js";
 import {
   buildResolveContext,
   resolveModuleSpecifier,
 } from "../src/index/module-resolve.js";
 import { listCallers } from "../src/query/callers.js";
+import { extractTypeScriptFile } from "../src/extract/typescript.js";
 
 const fixtureSrc = join(__dirname, "fixtures/medium-repo");
 let root: string;
@@ -72,7 +79,8 @@ describe("module resolve (paths + packages)", () => {
       const callers = db.edgesTo(add.id, "calls");
       expect(
         callers.some(
-          (e) => e.file_path === "src/services/calc.ts" && e.confidence === "strong",
+          (e) =>
+            e.file_path === "src/services/calc.ts" && e.confidence === "strong",
         ),
       ).toBe(true);
     } finally {
@@ -86,8 +94,52 @@ describe("module resolve (paths + packages)", () => {
   });
 });
 
+describe("export * star reexport", () => {
+  it("extracts export * binding", async () => {
+    const src = readFileSync(join(fixtureSrc, "src/lib/barrel.ts"), "utf8");
+    const ex = await extractTypeScriptFile(
+      "src/lib/barrel.ts",
+      src,
+      "typescript",
+    );
+    expect(
+      ex.bindings.some(
+        (b) => b.isStarReexport && b.moduleSpecifier.includes("math"),
+      ),
+    ).toBe(true);
+  });
+
+  it("resolves plus → add through export * barrel", () => {
+    const db = GraphDb.open(root);
+    try {
+      const stars = db.starReexportsFrom("src/lib/barrel.ts");
+      expect(stars.some((s) => s.module_path === "src/lib/math.ts")).toBe(true);
+
+      const b = db
+        .bindingsInFile("src/services/via-barrel.ts")
+        .find((x) => x.local_name === "plus");
+      expect(b?.module_path).toBe("src/lib/barrel.ts");
+      expect(b?.imported_name).toBe("add");
+
+      const add = db
+        .findNodesByName("add")
+        .find((n) => n.file_path.includes("math"))!;
+      const callers = db.edgesTo(add.id, "calls");
+      expect(
+        callers.some(
+          (e) =>
+            e.file_path === "src/services/via-barrel.ts" &&
+            e.confidence === "strong",
+        ),
+      ).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+});
+
 describe("incremental dirty rebind", () => {
-  it("removes stale strong caller after export deleted + reindex", async () => {
+  it("sum call is not strong-resolved after add export deleted", async () => {
     const iso = mkdtempSync(join(tmpdir(), "cs-rename-"));
     try {
       cpSync(fixtureSrc, iso, { recursive: true });
@@ -98,14 +150,22 @@ describe("incremental dirty rebind", () => {
         .findNodesByName("add")
         .find((n) => n.file_path.includes("math"));
       expect(addBefore).toBeTruthy();
-      const callersBefore = db.edgesTo(addBefore!.id, "calls").length;
-      expect(callersBefore).toBeGreaterThan(0);
+      const oldAddId = addBefore!.id;
+      const totalBefore = db
+        .nodesInFile("src/services/calc.ts")
+        .find((n) => n.name === "total")!;
+      const sumEdgesBefore = db
+        .edgesFrom(totalBefore.id, "calls")
+        .filter((e) => e.raw_name === "sum" || e.raw_name === "add");
+      expect(
+        sumEdgesBefore.some(
+          (e) => e.resolved && e.confidence === "strong" && e.dst_id === oldAddId,
+        ),
+      ).toBe(true);
       db.close();
 
-      // delete add from math.ts
-      const mathPath = join(iso, "src/lib/math.ts");
       writeFileSync(
-        mathPath,
+        join(iso, "src/lib/math.ts"),
         `export function mul(a: number, b: number): number {
   return a * b;
 }
@@ -117,33 +177,41 @@ describe("incremental dirty rebind", () => {
 
       db = GraphDb.open(iso);
       try {
-        const addAfter = db
-          .findNodesByName("add")
-          .find((n) => n.file_path.includes("math"));
-        expect(addAfter).toBeFalsy();
+        expect(
+          db.findNodesByName("add").find((n) => n.file_path.includes("math")),
+        ).toBeFalsy();
+        expect(db.getNode(oldAddId)).toBeNull();
 
-        // calc still imports add as sum — binding may point at missing export
-        const edges = db
-          .edgesFrom(
-            db.nodesInFile("src/services/calc.ts").find((n) => n.name === "total")!
-              .id,
-            "calls",
-          )
+        const total = db
+          .nodesInFile("src/services/calc.ts")
+          .find((n) => n.name === "total")!;
+        const sumEdges = db
+          .edgesFrom(total.id, "calls")
           .filter((e) => e.raw_name === "sum" || e.raw_name === "add");
-        // should not be strong-resolved to a dead node
-        for (const e of edges) {
-          if (e.resolved && e.dst_id) {
-            expect(db.getNode(e.dst_id)).toBeTruthy();
+
+        // Core claim: must NOT stay strong-resolved to a live target named add
+        for (const e of sumEdges) {
+          if (e.resolved && e.confidence === "strong" && e.dst_id) {
+            const dst = db.getNode(e.dst_id);
+            expect(dst).toBeTruthy();
+            expect(dst!.name).not.toBe("add");
+            expect(e.dst_id).not.toBe(oldAddId);
           }
         }
-        // no edge should still point at old add id
-        const allCalls = db.unresolvedBindableEdges();
-        void allCalls;
-        const anyDst = db
-          .listFiles()
-          .flatMap((f) => db.nodesInFile(f.path))
-          .filter((n) => n.name === "add");
-        expect(anyDst.length).toBe(0);
+        // Prefer: unresolved or non-strong after delete
+        const stillStrongToMissing = sumEdges.filter(
+          (e) =>
+            e.resolved &&
+            e.confidence === "strong" &&
+            e.dst_id === oldAddId,
+        );
+        expect(stillStrongToMissing.length).toBe(0);
+
+        const strongSum = sumEdges.filter(
+          (e) => e.resolved && e.confidence === "strong",
+        );
+        // After delete, binding sum←add cannot resolve — edge should be unresolved or weak-only
+        expect(strongSum.length).toBe(0);
       } finally {
         db.close();
       }
@@ -158,7 +226,6 @@ describe("incremental dirty rebind", () => {
     try {
       const t = computeTrust(db);
       expect(t.trust).not.toBe("stale");
-      // rewrite same bytes
       const p = join(root, "src/index.ts");
       writeFileSync(p, readFileSync(p));
       const t2 = computeTrust(db);

@@ -174,7 +174,10 @@ function resolveExportInModule(
   db: GraphDb,
   modulePath: string,
   importedName: string,
+  depth = 0,
 ): GraphNode | null {
+  if (depth > 6) return null;
+
   if (importedName === "default") {
     return db.findDefaultExport(modulePath);
   }
@@ -186,6 +189,39 @@ function resolveExportInModule(
       (n) => n.name === importedName || n.qualified_name === importedName,
     );
   if (exported.length === 1) return exported[0] ?? null;
+
+  // Named re-export binding: export { add } from './math' stored as binding
+  // with local_name=add, imported_name=add on the barrel file
+  const namedRe = db
+    .bindingsInFile(modulePath)
+    .filter(
+      (b) =>
+        !b.is_star_reexport &&
+        !b.is_namespace &&
+        b.module_path &&
+        (b.local_name === importedName || b.imported_name === importedName),
+    );
+  if (namedRe.length === 1 && namedRe[0]!.module_path) {
+    const hit = resolveExportInModule(
+      db,
+      namedRe[0]!.module_path,
+      namedRe[0]!.imported_name,
+      depth + 1,
+    );
+    if (hit) return hit;
+  }
+
+  // export * from './math' — follow star reexports
+  for (const star of db.starReexportsFrom(modulePath)) {
+    if (!star.module_path) continue;
+    const hit = resolveExportInModule(
+      db,
+      star.module_path,
+      importedName,
+      depth + 1,
+    );
+    if (hit) return hit;
+  }
 
   const any = db
     .nodesInFile(modulePath)

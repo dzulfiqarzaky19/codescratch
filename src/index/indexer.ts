@@ -130,6 +130,7 @@ export async function indexRepo(
             module_path: null,
             is_type_only: b.isTypeOnly,
             is_namespace: b.isNamespace,
+            is_star_reexport: b.isStarReexport === true,
             line: b.line,
           });
         }

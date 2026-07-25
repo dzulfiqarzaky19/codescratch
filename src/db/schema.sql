@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS bindings (
   module_path      TEXT,
   is_type_only     INTEGER NOT NULL DEFAULT 0,
   is_namespace     INTEGER NOT NULL DEFAULT 0,
+  is_star_reexport INTEGER NOT NULL DEFAULT 0,
   line             INTEGER NOT NULL,
   FOREIGN KEY (file_path) REFERENCES files(path) ON DELETE CASCADE
 );
