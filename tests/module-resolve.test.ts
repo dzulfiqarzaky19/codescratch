@@ -287,6 +287,50 @@ describe("incremental dirty rebind", () => {
       rmSync(iso, { recursive: true, force: true });
     }
   });
+
+  it("no orphan resolved edges after a weak target's file is deleted", async () => {
+    const iso = mkdtempSync(join(tmpdir(), "cs-orphan-"));
+    try {
+      mkdirSync(join(iso, "src"), { recursive: true });
+      writeFileSync(
+        join(iso, "src/a.ts"),
+        `export function helperOnlyHere(): number { return 1; }\n`,
+      );
+      // no import — binds weak via unique-global, so b.ts is not an importer
+      writeFileSync(
+        join(iso, "src/b.ts"),
+        `export function useIt(): number { return helperOnlyHere(); }\n`,
+      );
+      await indexRepo(iso, { full: true });
+
+      let db = GraphDb.open(iso);
+      const helper = db.findNodesByName("helperOnlyHere")[0];
+      expect(helper).toBeTruthy();
+      const weak = db
+        .edgesTo(helper!.id, "calls")
+        .filter((e) => e.file_path === "src/b.ts");
+      expect(weak.length).toBe(1);
+      expect(weak[0]!.confidence).toBe("weak");
+      db.close();
+
+      unlinkSync(join(iso, "src/a.ts"));
+      await indexRepo(iso, { full: false });
+
+      db = GraphDb.open(iso);
+      try {
+        const orphans = db.db
+          .prepare(
+            `SELECT COUNT(*) AS c FROM edges WHERE resolved = 1 AND dst_id IS NULL`,
+          )
+          .get() as { c: number };
+        expect(orphans.c).toBe(0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(iso, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("named reexport vs plain import", () => {

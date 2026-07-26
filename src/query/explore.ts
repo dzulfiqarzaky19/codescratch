@@ -12,7 +12,8 @@ export function exploreSymbol(target: string, rootInput?: string): string {
   const db = GraphDb.open(root);
   try {
     const trust = computeTrust(db);
-    const node = resolveTarget(db, target);
+    const match = resolveTarget(db, target);
+    const node = match.node;
     if (!node) {
       return wrapResult(
         trust,
@@ -20,6 +21,7 @@ export function exploreSymbol(target: string, rootInput?: string): string {
         { results: [] },
       );
     }
+    const ambiguous = ambiguityNote(match);
 
     const outEdges = db.edgesFrom(node.id);
     const inEdges = db.edgesTo(node.id);
@@ -38,6 +40,7 @@ export function exploreSymbol(target: string, rootInput?: string): string {
 
     const snippet = readSnippet(root, node);
     const lines: string[] = [
+      ...(ambiguous ? [ambiguous, ""] : []),
       "explore:",
       formatNodeDetail(node, snippet),
       "",
@@ -80,44 +83,59 @@ export function exploreSymbol(target: string, rootInput?: string): string {
       calls: calls.length,
       callers: callers.length,
       imports: imports.length,
+      candidates: candidatePayload(match),
     });
   } finally {
     db.close();
   }
 }
 
-export function resolveTarget(db: GraphDb, target: string): GraphNode | null {
+export interface TargetMatch {
+  node: GraphNode | null;
+  /** every match when >1 — the pick is a heuristic and must be disclosed */
+  candidates: GraphNode[];
+}
+
+export function resolveTarget(db: GraphDb, target: string): TargetMatch {
+  const one = (node: GraphNode | null): TargetMatch => ({
+    node,
+    candidates: [],
+  });
+
   // exact id
   const byId = db.getNode(target);
-  if (byId) return byId;
+  if (byId) return one(byId);
 
   // path
   const asPath = target.replace(/\\/g, "/").replace(/^\.\//, "");
   const fileNodes = db.nodesInFile(asPath);
   if (fileNodes.length) {
-    return (
-      fileNodes.find((n) => n.kind === "file") ?? fileNodes[0] ?? null
-    );
+    return one(fileNodes.find((n) => n.kind === "file") ?? fileNodes[0] ?? null);
   }
 
   // qualified name
   const q = db.findNodesByQualifiedName(target);
-  if (q.length === 1) return q[0] ?? null;
+  if (q.length === 1) return one(q[0] ?? null);
   if (q.length > 1) {
-    return q.find((n) => n.exported) ?? q[0] ?? null;
+    return {
+      node: q.find((n) => n.exported) ?? q[0] ?? null,
+      candidates: q,
+    };
   }
 
   // bare name
   const byName = db.findNodesByName(target, 20);
-  if (byName.length === 1) return byName[0] ?? null;
+  if (byName.length === 1) return one(byName[0] ?? null);
   if (byName.length > 1) {
     const exported = byName.filter((n) => n.exported);
-    if (exported.length === 1) return exported[0] ?? null;
+    if (exported.length === 1) {
+      return { node: exported[0] ?? null, candidates: byName };
+    }
     // prefer function/class over file
     const ranked = [...byName].sort(
       (a, b) => kindRank(a.kind) - kindRank(b.kind),
     );
-    return ranked[0] ?? null;
+    return { node: ranked[0] ?? null, candidates: byName };
   }
 
   // name@path
@@ -127,11 +145,36 @@ export function resolveTarget(db: GraphDb, target: string): GraphNode | null {
       const hit = db
         .nodesInFile(path.replace(/\\/g, "/"))
         .find((n) => n.name === name || n.qualified_name === name);
-      if (hit) return hit;
+      if (hit) return one(hit);
     }
   }
 
-  return null;
+  return one(null);
+}
+
+/** Disclosure line when the pick was a guess among several matches. */
+export function ambiguityNote(m: TargetMatch): string | null {
+  if (!m.node || m.candidates.length < 2) return null;
+  const others = m.candidates
+    .filter((c) => c.id !== m.node!.id)
+    .slice(0, 5)
+    .map((c) => `${c.kind} ${c.qualified_name} (${c.file_path}:${c.start_line})`);
+  return (
+    `ambiguous: ${m.candidates.length} matched, showing ${m.node.qualified_name} ` +
+    `(${m.node.file_path}:${m.node.start_line}) — others: ${others.join(", ")}`
+  );
+}
+
+/** JSON payload form — same list, machine-readable. */
+export function candidatePayload(m: TargetMatch) {
+  if (m.candidates.length < 2) return undefined;
+  return m.candidates.map((c) => ({
+    id: c.id,
+    kind: c.kind,
+    qualified_name: c.qualified_name,
+    file_path: c.file_path,
+    start_line: c.start_line,
+  }));
 }
 
 function kindRank(kind: string): number {
@@ -170,6 +213,7 @@ function formatEdgeLine(
     raw_name: string;
     resolved: boolean;
     confidence: string | null;
+    reason: string | null;
     line: number;
     file_path: string;
   },
@@ -179,8 +223,9 @@ function formatEdgeLine(
   const other = otherId ? db.getNode(otherId) : null;
   const conf =
     e.resolved && e.confidence ? ` conf=${e.confidence}` : e.resolved ? "" : " (unresolved)";
+  const why = e.resolved && e.reason ? ` reason=${e.reason}` : "";
   const label = other
     ? formatNodeShort(other)
     : `${e.raw_name}${e.resolved ? "" : " (unresolved)"}`;
-  return `  - [${e.kind}] ${label}  @${e.file_path}:${e.line}${conf}`;
+  return `  - [${e.kind}] ${label}  @${e.file_path}:${e.line}${conf}${why}`;
 }

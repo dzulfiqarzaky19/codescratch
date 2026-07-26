@@ -85,6 +85,7 @@ export async function indexRepo(
           path: relPath,
           hash,
           mtime_ms: st.mtimeMs,
+          size_bytes: st.size,
           language,
           indexed_at: now,
         });
@@ -151,6 +152,7 @@ export async function indexRepo(
               raw_name: ref.rawName,
               resolved: !!dst,
               confidence: dst ? "strong" : null,
+              reason: dst ? "same-file" : null,
               file_path: relPath,
               line: ref.line,
             });
@@ -163,8 +165,11 @@ export async function indexRepo(
 
           let dst: string | null = null;
           let resolved = false;
+          // Dotted names (x.bar, this.bar) need receiver logic — leave them to
+          // resolveEdges. Binding them here by bare name is a false strong.
           if (
             ref.targetHint &&
+            !ref.rawName.includes(".") &&
             (ref.kind === "calls" ||
               ref.kind === "extends" ||
               ref.kind === "implements")
@@ -186,6 +191,7 @@ export async function indexRepo(
             raw_name: ref.rawName,
             resolved,
             confidence: resolved ? "strong" : null,
+            reason: resolved ? "same-file" : null,
             file_path: relPath,
             line: ref.line,
           });
@@ -254,11 +260,12 @@ export async function indexRepo(
 
 function findLocalByName(
   qnToId: Map<string, string>,
-  symbols: { name: string; qualifiedName: string }[],
+  symbols: { name: string; qualifiedName: string; kind: string }[],
   name: string,
 ): string | null {
-  const simple = name.includes(".") ? (name.split(".").pop() ?? name) : name;
-  const matches = symbols.filter((s) => s.name === simple || s.name === name);
+  // Callers pass bare names only; methods require a receiver, so exclude them
+  // to stay consistent with resolveCallLike.
+  const matches = symbols.filter((s) => s.kind !== "method" && s.name === name);
   if (matches.length === 1) {
     return qnToId.get(matches[0]!.qualifiedName) ?? null;
   }

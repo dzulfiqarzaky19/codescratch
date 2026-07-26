@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { resolveRoot } from "./config.js";
-import { indexRepo } from "./index/indexer.js";
+import { ensureRepo } from "./host/ensure.js";
 import { listCallees, listCallers } from "./query/callers.js";
 import { exploreSymbol } from "./query/explore.js";
 import { impactAnalysis } from "./query/impact.js";
@@ -138,17 +138,35 @@ server.tool(
 
 server.tool(
   "cs_reindex",
-  "Incremental reindex of the repo graph (hash-based). Use when trust=stale or after large edits. full=true forces full rebuild.",
+  "Emergency reindex via host single-flight lock. Prefer host hooks (codescratch ensure). Use when trust stuck stale/rebuilding or host path is down. full=true forces full rebuild.",
   {
     root: rootParam,
     full: z.boolean().optional().describe("Force full index (default false)"),
   },
   async ({ root, full }) => {
     try {
-      const stats = await indexRepo(pickRoot(root), { full: full === true });
+      const result = await ensureRepo(pickRoot(root), {
+        full: full === true,
+        waitMs: 15_000,
+      });
+      if (result.coalesced) {
+        return text(
+          [
+            "reindex coalesced — another ensure holds the lock; pending set",
+            `root: ${result.root}`,
+            "",
+            statusReport(result.root),
+          ].join("\n"),
+        );
+      }
+      if (result.error) {
+        return err(new Error(result.error));
+      }
+      const stats = result.stats!;
       const body = [
-        `reindex ${stats.full ? "full" : "incremental"}`,
+        `reindex ${result.full ? "full" : "incremental"}  passes=${result.passes}`,
         `root: ${stats.root}`,
+        `head: ${result.head || "(none)"}`,
         `files: ${stats.files_total}  indexed: ${stats.files_indexed}  skipped: ${stats.files_skipped}  removed: ${stats.files_removed}`,
         `nodes: ${stats.nodes}  edges: ${stats.edges}  unresolved: ${stats.unresolved_edges}  bindings: ${stats.bindings}`,
         `duration: ${stats.duration_ms}ms`,

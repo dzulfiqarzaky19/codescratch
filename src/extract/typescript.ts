@@ -88,7 +88,7 @@ function walk(
     case "method_definition":
     case "method_signature": {
       const name = methodName(node);
-      if (name && enclosing) {
+      if (name && enclosing && methodOwnerOk(node)) {
         const qn = `${enclosing}.${name}`;
         symbols.push({
           kind: "method",
@@ -192,7 +192,10 @@ function walk(
     }
     case "lexical_declaration":
     case "variable_declaration": {
-      if (!enclosing) {
+      // enclosing is null inside an unnamed scope too (a callback arrow), so a
+      // local there would be emitted as a top-level symbol and collide on
+      // nodeId with every same-named local in the file. Require module level.
+      if (!enclosing && atModuleLevel(node)) {
         for (const decl of namedChildren(node).filter(
           (c) => c.type === "variable_declarator",
         )) {
@@ -637,6 +640,32 @@ function hasExportModifier(node: Node): boolean {
 function childText(node: Node, field: string): string | null {
   const c = node.childForFieldName(field);
   return c ? c.text : null;
+}
+
+/** Declaration sits directly in the module body (only `export` may wrap it). */
+function atModuleLevel(node: Node): boolean {
+  let p: Node | null = node.parent;
+  while (p) {
+    if (p.type === "program" || p.type === "module") return true;
+    if (p.type !== "export_statement") return false;
+    p = p.parent;
+  }
+  return false;
+}
+
+/**
+ * True only for members of a real class/interface. A `method_signature` inside
+ * an `object_type` (param type, type alias) is a shape, not a symbol — emitting
+ * it invents nodes like `take.run` and poisons unique-name resolution.
+ */
+function methodOwnerOk(node: Node): boolean {
+  let p: Node | null = node.parent;
+  while (p) {
+    if (p.type === "class_body" || p.type === "interface_body") return true;
+    if (p.type === "object_type" || p.type === "statement_block") return false;
+    p = p.parent;
+  }
+  return false;
 }
 
 function methodName(node: Node): string | null {

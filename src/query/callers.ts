@@ -1,7 +1,7 @@
 import { resolveRoot } from "../config.js";
 import { GraphDb } from "../db/client.js";
-import type { EdgeConfidence, GraphNode } from "../models.js";
-import { resolveTarget } from "./explore.js";
+import type { EdgeConfidence, EdgeReason, GraphNode } from "../models.js";
+import { ambiguityNote, candidatePayload, resolveTarget } from "./explore.js";
 import { formatNodeShort, wrapResult } from "./format.js";
 import { computeTrust, requireGraph } from "./trust.js";
 
@@ -32,12 +32,14 @@ function walkCalls(
   const db = GraphDb.open(root);
   try {
     const trust = computeTrust(db);
-    const node = resolveTarget(db, target);
+    const match = resolveTarget(db, target);
+    const node = match.node;
     if (!node) {
       return wrapResult(trust, `No symbol matched ${JSON.stringify(target)}.`, {
         results: [],
       });
     }
+    const ambiguous = ambiguityNote(match);
 
     const maxDepth = Math.max(1, Math.min(depth, 6));
     const results: {
@@ -46,6 +48,7 @@ function walkCalls(
       line: number;
       file: string;
       confidence: EdgeConfidence | null;
+      reason: EdgeReason | null;
     }[] = [];
     const seen = new Set<string>([node.id]);
     let frontier: { id: string; depth: number }[] = [{ id: node.id, depth: 0 }];
@@ -73,6 +76,7 @@ function walkCalls(
             line: e.line,
             file: e.file_path,
             confidence: e.confidence,
+            reason: e.reason,
           });
           next.push({ id: otherId, depth: f.depth + 1 });
         }
@@ -81,10 +85,12 @@ function walkCalls(
     }
 
     const body = [
+      ambiguous,
       `${mode} of ${formatNodeShort(node)}  depth≤${maxDepth}  (${results.length})`,
       ...results.map((r) => {
         const conf = r.confidence ? ` conf=${r.confidence}` : "";
-        return `  d${r.depth} ${formatNodeShort(r.node)}  via ${r.file}:${r.line}${conf}`;
+        const why = r.reason ? ` reason=${r.reason}` : "";
+        return `  d${r.depth} ${formatNodeShort(r.node)}  via ${r.file}:${r.line}${conf}${why}`;
       }),
       results.length === 0
         ? "  (none resolved — check unresolved edges / dynamic calls)"
@@ -97,12 +103,14 @@ function walkCalls(
       target: node.qualified_name,
       mode,
       count: results.length,
+      candidates: candidatePayload(match),
       results: results.map((r) => ({
         id: r.node.id,
         qualified_name: r.node.qualified_name,
         file_path: r.node.file_path,
         depth: r.depth,
         confidence: r.confidence,
+        reason: r.reason,
       })),
     });
   } finally {

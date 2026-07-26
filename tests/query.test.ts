@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, cpSync } from "node:fs";
+import { mkdtempSync, rmSync, cpSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { indexRepo } from "../src/index/indexer.js";
@@ -40,6 +40,29 @@ describe("query layer", () => {
     const s = exploreSymbol("add", root);
     expect(s).toMatch(/add/);
     expect(s).toMatch(/trust:/);
+  });
+
+  it("explore discloses ambiguous name matches", async () => {
+    const iso = mkdtempSync(join(tmpdir(), "cs-ambig-"));
+    try {
+      mkdirSync(join(iso, "src"), { recursive: true });
+      writeFileSync(
+        join(iso, "src/one.ts"),
+        `export function dup(): number { return 1; }\n`,
+      );
+      writeFileSync(
+        join(iso, "src/two.ts"),
+        `export function dup(): number { return 2; }\n`,
+      );
+      await indexRepo(iso, { full: true });
+      const s = exploreSymbol("dup", iso);
+      expect(s).toMatch(/ambiguous: 2 matched/);
+      expect(s).toMatch(/src\/one\.ts/);
+      expect(s).toMatch(/src\/two\.ts/);
+      expect(s).toMatch(/"candidates"/);
+    } finally {
+      rmSync(iso, { recursive: true, force: true });
+    }
   });
 
   it("callers of add is non-empty and labels conf=", () => {

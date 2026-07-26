@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS files (
   path       TEXT PRIMARY KEY,
   hash       TEXT NOT NULL,
   mtime_ms   INTEGER NOT NULL,
+  size_bytes INTEGER NOT NULL DEFAULT 0,
   language   TEXT NOT NULL,
   indexed_at TEXT NOT NULL
 );
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS edges (
   raw_name   TEXT NOT NULL,
   resolved   INTEGER NOT NULL DEFAULT 0,
   confidence TEXT,
+  reason     TEXT,
   file_path  TEXT NOT NULL,
   line       INTEGER NOT NULL,
   FOREIGN KEY (src_id) REFERENCES nodes(id) ON DELETE CASCADE,

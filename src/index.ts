@@ -1,4 +1,5 @@
 export { indexRepo } from "./index/indexer.js";
+export { ensureRepo } from "./host/ensure.js";
 export { exploreSymbol } from "./query/explore.js";
 export { searchSymbols } from "./query/search.js";
 export { listCallers, listCallees } from "./query/callers.js";

@@ -1,6 +1,6 @@
 import type { GraphDb } from "../db/client.js";
 import { nodeId } from "../db/client.js";
-import type { EdgeConfidence, GraphNode } from "../models.js";
+import type { EdgeConfidence, EdgeReason, GraphNode } from "../models.js";
 import {
   buildResolveContext,
   resolveModuleSpecifier,
@@ -37,17 +37,26 @@ export function resolveEdges(
   const fileSet = new Set(files);
   const ctx = buildResolveContext(root, fileSet);
 
+  // A deleted node nulls dst_id via FK but leaves resolved=1. Such a caller may
+  // be nowhere near the dirty set (weak unique-global binders never import it),
+  // so sweep globally and pull those files into scope for a rebind attempt.
+  const orphanFiles = db
+    .unresolveOrphanEdges()
+    .filter((p) => fileSet.has(p));
+
   let scope: string[] | undefined;
   const hasDirty = opts?.dirtyFiles && opts.dirtyFiles.length > 0;
   const hasExtra =
     opts?.extraRebindFiles && opts.extraRebindFiles.length > 0;
+  // Only extends an existing narrow scope — when scope stays undefined the
+  // resolve is already repo-wide, so unioning here would narrow it instead.
   if (hasDirty || hasExtra) {
     const dirty = (opts?.dirtyFiles ?? []).filter((p) => fileSet.has(p));
     const deps = dirty.length > 0 ? db.filesImportingModules(dirty) : [];
     const extra = (opts?.extraRebindFiles ?? []).filter((p) =>
       fileSet.has(p),
     );
-    scope = [...new Set([...dirty, ...deps, ...extra])];
+    scope = [...new Set([...dirty, ...deps, ...extra, ...orphanFiles])];
   }
 
   // Correctness: when anything dirty, unresolve call-like edges in scope so
@@ -82,7 +91,12 @@ export function resolveEdges(
       if (!targetFile) continue;
       const fileNode = db.getNode(nodeId(targetFile, targetFile));
       if (!fileNode) continue;
-      db.updateEdgeResolution(edge.id, fileNode.id, "strong");
+      db.updateEdgeResolution(
+        edge.id,
+        fileNode.id,
+        "strong",
+        "import-binding",
+      );
       resolved++;
       continue;
     }
@@ -92,9 +106,19 @@ export function resolveEdges(
       edge.kind === "extends" ||
       edge.kind === "implements"
     ) {
-      const hit = resolveCallLike(db, edge.file_path, edge.raw_name);
+      const hit = resolveCallLike(
+        db,
+        edge.file_path,
+        edge.raw_name,
+        edge.src_id,
+      );
       if (!hit) continue;
-      db.updateEdgeResolution(edge.id, hit.node.id, hit.confidence);
+      db.updateEdgeResolution(
+        edge.id,
+        hit.node.id,
+        hit.confidence,
+        hit.reason,
+      );
       resolved++;
     }
   }
@@ -121,63 +145,125 @@ export function resolveWithContext(
   return resolveModuleSpecifier(ctx, fromFile, specifier);
 }
 
+interface CallHit {
+  node: GraphNode;
+  confidence: EdgeConfidence;
+  reason: EdgeReason;
+}
+
+/**
+ * Bind one call-like edge. No type info exists, so a member call on an unknown
+ * receiver is `weak`/`receiver-unknown` — never strong. `srcId` is the edge's
+ * source node, needed to find the enclosing class for `this.x`.
+ */
 function resolveCallLike(
   db: GraphDb,
   filePath: string,
   rawName: string,
-): { node: GraphNode; confidence: EdgeConfidence } | null {
-  const simple = rawName.includes(".")
-    ? (rawName.split(".").pop() ?? rawName)
-    : rawName;
+  srcId: string | null,
+): CallHit | null {
+  const dotted = rawName.includes(".");
+  const simple = dotted ? (rawName.split(".").pop() ?? rawName) : rawName;
+  const receiver = dotted ? rawName.slice(0, rawName.lastIndexOf(".")) : null;
 
-  const local = db.nodesInFile(filePath).filter(
-    (n) =>
-      n.kind !== "file" &&
-      (n.name === simple ||
-        n.qualified_name === simple ||
-        n.qualified_name === rawName ||
-        n.qualified_name.endsWith(`.${simple}`)),
-  );
-  if (local.length === 1) {
-    return { node: local[0]!, confidence: "strong" };
-  }
-  if (local.length > 1) {
-    const nonMethod = local.filter((n) => n.kind !== "method");
-    if (nonMethod.length === 1) {
-      return { node: nonMethod[0]!, confidence: "strong" };
+  if (!dotted) {
+    // Bare `foo()` never denotes a method — methods need a receiver.
+    const local = db
+      .nodesInFile(filePath)
+      .filter(
+        (n) =>
+          n.kind !== "file" &&
+          n.kind !== "method" &&
+          (n.name === simple || n.qualified_name === simple),
+      );
+    if (local.length === 1) {
+      return { node: local[0]!, confidence: "strong", reason: "same-file" };
+    }
+    if (local.length > 1) return null;
+
+    const bindings = db.bindingsForLocal(filePath, simple);
+    if (bindings.length === 1) {
+      const b = bindings[0]!;
+      if (!b.is_namespace && b.module_path) {
+        const target = resolveExportInModule(db, b.module_path, b.imported_name);
+        if (target) {
+          return {
+            node: target,
+            confidence: "strong",
+            reason: "import-binding",
+          };
+        }
+      }
+    }
+
+    const unique = db.findUniqueByName(simple);
+    if (unique) {
+      return { node: unique, confidence: "weak", reason: "unique-global" };
     }
     return null;
   }
 
-  const bindings = db.bindingsForLocal(filePath, simple);
-  if (bindings.length === 1) {
-    const b = bindings[0]!;
-    if (b.is_namespace) return null;
-    if (!b.module_path) return null;
-    const target = resolveExportInModule(db, b.module_path, b.imported_name);
-    if (target) return { node: target, confidence: "strong" };
-  }
-
-  if (rawName.includes(".")) {
-    const [ns, ...rest] = rawName.split(".");
-    const prop = rest.join(".");
-    if (ns && prop) {
-      const nsBind = db
-        .bindingsForLocal(filePath, ns)
-        .filter((b) => b.is_namespace);
-      if (nsBind.length === 1 && nsBind[0]!.module_path) {
-        const target = resolveExportInModule(
-          db,
-          nsBind[0]!.module_path,
-          prop,
-        );
-        if (target) return { node: target, confidence: "strong" };
+  // this.x / this.#x — lexically certain: the enclosing class owns it.
+  if (receiver === "this") {
+    const owner = enclosingClassQn(db, filePath, srcId);
+    if (owner) {
+      const method = db
+        .nodesInFile(filePath)
+        .find((n) => n.qualified_name === `${owner}.${simple}`);
+      if (method) {
+        return { node: method, confidence: "strong", reason: "this-member" };
       }
     }
   }
 
+  // NS.x where NS is a namespace import — the module is known.
+  if (receiver) {
+    const nsBind = db
+      .bindingsForLocal(filePath, receiver)
+      .filter((b) => b.is_namespace);
+    if (nsBind.length === 1 && nsBind[0]!.module_path) {
+      const target = resolveExportInModule(db, nsBind[0]!.module_path, simple);
+      if (target) {
+        return {
+          node: target,
+          confidence: "strong",
+          reason: "namespace-member",
+        };
+      }
+    }
+  }
+
+  // Unknown receiver type. Keep the edge for navigation, label the guess.
   const unique = db.findUniqueByName(simple);
-  if (unique) return { node: unique, confidence: "weak" };
+  if (unique) {
+    return { node: unique, confidence: "weak", reason: "receiver-unknown" };
+  }
+  return null;
+}
+
+/**
+ * Nearest class/interface enclosing the edge's source node, via qualified-name
+ * prefixes (`Foo.bar.cb` → `Foo.bar` → `Foo`). Longest first.
+ */
+function enclosingClassQn(
+  db: GraphDb,
+  filePath: string,
+  srcId: string | null,
+): string | null {
+  if (!srcId) return null;
+  const src = db.getNode(srcId);
+  if (!src) return null;
+  const inFile = db.nodesInFile(filePath);
+  const parts = src.qualified_name.split(".");
+  for (let i = parts.length; i > 0; i--) {
+    const qn = parts.slice(0, i).join(".");
+    const owner = inFile.find(
+      (n) =>
+        n.qualified_name === qn &&
+        (n.kind === "class" || n.kind === "interface"),
+    );
+    if (owner) return owner.qualified_name;
+  }
   return null;
 }
 

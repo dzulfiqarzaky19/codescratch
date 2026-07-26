@@ -8,8 +8,10 @@ export function formatTrustLine(t: TrustInfo): string {
     `unresolved: ${t.unresolved_edge_count}`,
     `weak: ${t.weak_edge_count}`,
   ];
-  if (t.trust !== "fresh") {
-    bits.push(`reindex: ${t.reindex_cmd}`);
+  if (t.trust === "rebuilding") {
+    bits.push("host ensure in progress — absence ≠ proof");
+  } else if (t.trust !== "fresh") {
+    bits.push(`ensure: ${t.reindex_cmd}`);
   }
   return bits.join("  |  ");
 }

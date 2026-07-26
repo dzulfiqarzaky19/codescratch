@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type {
   EdgeConfidence,
   EdgeKind,
+  EdgeReason,
   FileRecord,
   GraphEdge,
   GraphNode,
@@ -26,7 +27,7 @@ function schemaPath(): string {
   throw new Error("schema.sql not found");
 }
 
-const EDGE_SELECT = `id, src_id, dst_id, kind, raw_name, resolved, confidence, file_path, line`;
+const EDGE_SELECT = `id, src_id, dst_id, kind, raw_name, resolved, confidence, reason, file_path, line`;
 
 export class GraphDb {
   readonly db: DatabaseSync;
@@ -51,6 +52,8 @@ export class GraphDb {
     const db = new DatabaseSync(path);
     db.exec("PRAGMA journal_mode = WAL;");
     db.exec("PRAGMA foreign_keys = ON;");
+    // Host ensure + MCP readers share the file; wait briefly instead of throwing.
+    db.exec("PRAGMA busy_timeout = 5000;");
     if (opts?.create || !tableExists(db, "nodes")) {
       db.exec(readFileSync(schemaPath(), "utf8"));
     }
@@ -81,15 +84,23 @@ export class GraphDb {
   upsertFile(rec: FileRecord): void {
     this.db
       .prepare(
-        `INSERT INTO files(path, hash, mtime_ms, language, indexed_at)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO files(path, hash, mtime_ms, size_bytes, language, indexed_at)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(path) DO UPDATE SET
            hash = excluded.hash,
            mtime_ms = excluded.mtime_ms,
+           size_bytes = excluded.size_bytes,
            language = excluded.language,
            indexed_at = excluded.indexed_at`,
       )
-      .run(rec.path, rec.hash, rec.mtime_ms, rec.language, rec.indexed_at);
+      .run(
+        rec.path,
+        rec.hash,
+        rec.mtime_ms,
+        rec.size_bytes,
+        rec.language,
+        rec.indexed_at,
+      );
   }
 
   getFile(path: string): FileRecord | null {
@@ -97,7 +108,7 @@ export class GraphDb {
       row<FileRecord>(
         this.db
           .prepare(
-            `SELECT path, hash, mtime_ms, language, indexed_at FROM files WHERE path = ?`,
+            `SELECT path, hash, mtime_ms, size_bytes, language, indexed_at FROM files WHERE path = ?`,
           )
           .get(path),
       ) ?? null
@@ -108,7 +119,7 @@ export class GraphDb {
     return rows<FileRecord>(
       this.db
         .prepare(
-          `SELECT path, hash, mtime_ms, language, indexed_at FROM files ORDER BY path`,
+          `SELECT path, hash, mtime_ms, size_bytes, language, indexed_at FROM files ORDER BY path`,
         )
         .all(),
     );
@@ -150,13 +161,14 @@ export class GraphDb {
     raw_name: string;
     resolved: boolean;
     confidence?: EdgeConfidence | null;
+    reason?: EdgeReason | null;
     file_path: string;
     line: number;
   }): void {
     this.db
       .prepare(
-        `INSERT INTO edges(src_id, dst_id, kind, raw_name, resolved, confidence, file_path, line)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO edges(src_id, dst_id, kind, raw_name, resolved, confidence, reason, file_path, line)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         edge.src_id,
@@ -165,6 +177,7 @@ export class GraphDb {
         edge.raw_name,
         edge.resolved ? 1 : 0,
         edge.confidence ?? null,
+        edge.reason ?? null,
         edge.file_path,
         edge.line,
       );
@@ -174,12 +187,13 @@ export class GraphDb {
     id: number,
     dst_id: string,
     confidence: EdgeConfidence = "strong",
+    reason: EdgeReason | null = null,
   ): void {
     this.db
       .prepare(
-        `UPDATE edges SET dst_id = ?, resolved = 1, confidence = ? WHERE id = ?`,
+        `UPDATE edges SET dst_id = ?, resolved = 1, confidence = ?, reason = ? WHERE id = ?`,
       )
-      .run(dst_id, confidence, id);
+      .run(dst_id, confidence, reason, id);
   }
 
   insertBinding(b: {
@@ -427,6 +441,8 @@ export class GraphDb {
     edges: number;
     unresolved: number;
     weak: number;
+    /** subset of weak that is a same-file receiver guess, not a global-name guess */
+    weak_receiver_unknown: number;
     bindings: number;
   } {
     const files = row<{ c: number }>(
@@ -450,12 +466,28 @@ export class GraphDb {
         )
         .get(),
     )!.c;
+    const weakReceiver = row<{ c: number }>(
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM edges
+           WHERE resolved = 1 AND confidence = 'weak' AND reason = 'receiver-unknown'`,
+        )
+        .get(),
+    )!.c;
     const bindings = tableExists(this.db, "bindings")
       ? row<{ c: number }>(
           this.db.prepare(`SELECT COUNT(*) AS c FROM bindings`).get(),
         )!.c
       : 0;
-    return { files, nodes, edges, unresolved, weak, bindings };
+    return {
+      files,
+      nodes,
+      edges,
+      unresolved,
+      weak,
+      weak_receiver_unknown: weakReceiver,
+      bindings,
+    };
   }
 
   transaction<T>(fn: () => T): T {
@@ -519,12 +551,35 @@ export class GraphDb {
     const ph = filePaths.map(() => "?").join(",");
     this.db
       .prepare(
-        `UPDATE edges SET dst_id = NULL, resolved = 0, confidence = NULL
+        `UPDATE edges SET dst_id = NULL, resolved = 0, confidence = NULL, reason = NULL
          WHERE file_path IN (${ph})
            AND kind IN ('calls','imports','extends','implements')
            AND resolved = 1`,
       )
       .run(...filePaths);
+  }
+
+  /**
+   * Edges whose target node died (FK `ON DELETE SET NULL` leaves resolved=1).
+   * Clears every kind — a stale `has_method` shows a ghost member in explore —
+   * but only call-like kinds are returned, since containment edges are rebuilt
+   * by re-extraction rather than by resolve.
+   */
+  unresolveOrphanEdges(): string[] {
+    const paths = rows<{ file_path: string }>(
+      this.db
+        .prepare(
+          `SELECT DISTINCT file_path FROM edges
+           WHERE resolved = 1 AND dst_id IS NULL
+             AND kind IN ('calls','imports','extends','implements')`,
+        )
+        .all(),
+    ).map((r) => r.file_path);
+    this.db.exec(
+      `UPDATE edges SET resolved = 0, confidence = NULL, reason = NULL
+       WHERE resolved = 1 AND dst_id IS NULL`,
+    );
+    return paths;
   }
 
   clearBindingModulePathsInFiles(filePaths: string[]): void {
@@ -542,6 +597,16 @@ function migrate(db: DatabaseSync): void {
   // edges.confidence
   if (tableExists(db, "edges") && !columnExists(db, "edges", "confidence")) {
     db.exec(`ALTER TABLE edges ADD COLUMN confidence TEXT`);
+  }
+  // edges.reason (v3) — old rows keep NULL; surfaces omit the label
+  if (tableExists(db, "edges") && !columnExists(db, "edges", "reason")) {
+    db.exec(`ALTER TABLE edges ADD COLUMN reason TEXT`);
+  }
+  // files.size_bytes (v4) — 0 means unknown, which forces a hash check
+  if (tableExists(db, "files") && !columnExists(db, "files", "size_bytes")) {
+    db.exec(
+      `ALTER TABLE files ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0`,
+    );
   }
   // bindings table
   if (!tableExists(db, "bindings")) {
@@ -606,6 +671,7 @@ interface DbEdge {
   raw_name: string;
   resolved: number;
   confidence: string | null;
+  reason: string | null;
   file_path: string;
   line: number;
 }
@@ -647,6 +713,7 @@ function mapEdge(r: DbEdge): GraphEdge {
     raw_name: r.raw_name,
     resolved: !!r.resolved,
     confidence: (r.confidence as EdgeConfidence | null) ?? null,
+    reason: (r.reason as EdgeReason | null) ?? null,
     file_path: r.file_path,
     line: r.line,
   };

@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, rmSync, cpSync } from "node:fs";
+import { mkdtempSync, rmSync, cpSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { indexRepo } from "../src/index/indexer.js";
@@ -68,6 +68,68 @@ describe("index + resolve", () => {
       expect(fromAlias.every((e) => e.confidence === "strong")).toBe(true);
     } finally {
       db.close();
+    }
+  });
+
+  it("does not strong-bind a call on an unknown receiver", async () => {
+    const iso = mkdtempSync(join(tmpdir(), "cs-recv-"));
+    try {
+      mkdirSync(join(iso, "src"), { recursive: true });
+      writeFileSync(
+        join(iso, "src/a.ts"),
+        "export class Foo { bar(): number { return 1; } }\n" +
+          "export function f(x: any): number { return x.bar(); }\n",
+      );
+      await indexRepo(iso, { full: true });
+      const db = GraphDb.open(iso);
+      try {
+        const bar = db
+          .findNodesByName("bar")
+          .find((n) => n.qualified_name === "Foo.bar")!;
+        expect(bar).toBeTruthy();
+        const edges = db
+          .edgesTo(bar.id, "calls")
+          .filter((e) => e.raw_name === "x.bar");
+        expect(edges.length).toBe(1);
+        expect(edges[0]!.confidence).toBe("weak");
+        expect(edges[0]!.reason).toBe("receiver-unknown");
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(iso, { recursive: true, force: true });
+    }
+  });
+
+  it("strong-binds this.x to the enclosing class method", async () => {
+    const iso = mkdtempSync(join(tmpdir(), "cs-this-"));
+    try {
+      mkdirSync(join(iso, "src"), { recursive: true });
+      writeFileSync(
+        join(iso, "src/b.ts"),
+        "export class Baz {\n" +
+          "  a(): number { return this.b(); }\n" +
+          "  b(): number { return 2; }\n" +
+          "}\n",
+      );
+      await indexRepo(iso, { full: true });
+      const db = GraphDb.open(iso);
+      try {
+        const b = db
+          .findNodesByName("b")
+          .find((n) => n.qualified_name === "Baz.b")!;
+        expect(b).toBeTruthy();
+        const edges = db
+          .edgesTo(b.id, "calls")
+          .filter((e) => e.raw_name === "this.b");
+        expect(edges.length).toBe(1);
+        expect(edges[0]!.confidence).toBe("strong");
+        expect(edges[0]!.reason).toBe("this-member");
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(iso, { recursive: true, force: true });
     }
   });
 

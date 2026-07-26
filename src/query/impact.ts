@@ -5,7 +5,7 @@ import {
 } from "../config.js";
 import { GraphDb } from "../db/client.js";
 import type { GraphNode, ImpactDirection } from "../models.js";
-import { resolveTarget } from "./explore.js";
+import { ambiguityNote, candidatePayload, resolveTarget } from "./explore.js";
 import { formatNodeShort, wrapResult } from "./format.js";
 import { computeTrust, requireGraph } from "./trust.js";
 
@@ -19,7 +19,8 @@ export function impactAnalysis(
   const db = GraphDb.open(root);
   try {
     const trust = computeTrust(db);
-    const node = resolveTarget(db, target);
+    const match = resolveTarget(db, target);
+    const node = match.node;
     if (!node) {
       return wrapResult(
         trust,
@@ -27,16 +28,19 @@ export function impactAnalysis(
         { results: [] },
       );
     }
+    const ambiguous = ambiguityNote(match);
 
     const seeds: GraphNode[] =
       node.kind === "file" ? db.nodesInFile(node.file_path) : [node];
 
     const sections: string[] = [
+      ...(ambiguous ? [ambiguous] : []),
       `impact of ${formatNodeShort(node)}  direction=${direction}`,
     ];
     const json: Record<string, unknown> = {
       target: node.qualified_name,
       direction,
+      candidates: candidatePayload(match),
     };
 
     if (direction === "up" || direction === "both") {
@@ -101,10 +105,11 @@ function bfs(
         const n = db.getNode(otherId);
         if (!n) continue;
         const conf = e.confidence ? ` conf=${e.confidence}` : "";
+        const why = e.reason ? ` reason=${e.reason}` : "";
         affected.set(n.id, {
           node: n,
           depth: f.depth + 1,
-          via: `${e.kind}@${e.file_path}:${e.line}${conf}`,
+          via: `${e.kind}@${e.file_path}:${e.line}${conf}${why}`,
         });
         next.push({ id: otherId, depth: f.depth + 1 });
       }

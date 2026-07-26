@@ -19,7 +19,24 @@ export type EdgeKind =
 
 export type EdgeConfidence = "strong" | "weak";
 
-export type TrustLevel = "fresh" | "stale" | "partial" | "missing";
+/**
+ * Why an edge bound to its target. `strong` is a binding/lexical fact, never a
+ * type check — `receiver-unknown` and `unique-global` are guesses.
+ */
+export type EdgeReason =
+  | "same-file"
+  | "import-binding"
+  | "namespace-member"
+  | "this-member"
+  | "unique-global"
+  | "receiver-unknown";
+
+export type TrustLevel =
+  | "fresh"
+  | "stale"
+  | "partial"
+  | "missing"
+  | "rebuilding";
 
 export type ImpactDirection = "up" | "down" | "both";
 
@@ -43,6 +60,8 @@ export interface GraphEdge {
   raw_name: string;
   resolved: boolean;
   confidence: EdgeConfidence | null;
+  /** null on pre-v3 rows */
+  reason: EdgeReason | null;
   file_path: string;
   line: number;
 }
@@ -66,6 +85,8 @@ export interface FileRecord {
   path: string;
   hash: string;
   mtime_ms: number;
+  /** 0 on pre-v4 rows — treated as unknown, forcing a hash check */
+  size_bytes: number;
   language: string;
   indexed_at: string;
 }
@@ -148,4 +169,4 @@ export const EXTRACTOR_LIMITATIONS = [
   "JSX component identity is syntactic only",
 ] as const;
 
-export const SCHEMA_VERSION = "2";
+export const SCHEMA_VERSION = "4";

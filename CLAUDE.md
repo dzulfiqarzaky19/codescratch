@@ -4,36 +4,66 @@ Local TS/JS code structure graph for AI agents. SQLite under `<repo>/.codescratc
 
 **Not coupled to memory-agent.** Hosts may load both MCP servers; no shared state.
 
-## Agent protocol
+## Hybrid freshness (host-owned)
+
+Graph currency is **host** work (`codescratch ensure` + Claude Code hooks), not the model.
+
+| Layer | Owner |
+|-------|--------|
+| Index freshness | Host: SessionStart + PostToolUse → `ensure` (single-flight, debounced) |
+| Deep structure | Agent MCP: explore / callers / impact / search |
+| Emergency rebuild | Agent `cs_reindex` only if host path down or trust stuck |
+
+### Agent protocol
 
 1. Prefer structural tools over blind grep for “where defined / who calls / blast radius”.
-2. Read `trust:` every reply. `stale` → run `cs_reindex` (or the `reindex:` command in the banner). `partial` / unresolved / `conf=weak` → do not treat absence as proof.
-3. Critical paths (auth, money, deletes): verify by reading source. Graph misses dynamic `import()`, DI, proxies.
+2. Read `trust:` every reply.
+   - `rebuilding` → host job in flight; **absence ≠ proof**; do not spam reindex.
+   - `stale` → host ensure should catch up; `cs_reindex` only if stuck.
+   - `partial` / unresolved / `conf=weak` → do not treat absence as proof.
+3. **Do not** call `cs_reindex` after every edit or every turn.
+4. Critical paths (auth, money, deletes): verify by reading source. Graph misses dynamic `import()`, DI, proxies.
 
 ### Tools
 
 | Tool | When |
 |------|------|
-| `cs_status` | Graph missing/stale? Exact reindex command. |
+| `cs_status` | Graph missing/stale/rebuilding? |
 | `cs_search` | Find symbol by name |
 | `cs_explore` | One symbol/file: members, calls, callers, imports, **bindings** |
 | `cs_callers` / `cs_callees` | Call edges (resolved; weak labeled) |
 | `cs_impact` | Blast radius: `direction=up\|down\|both` (default up) |
-| `cs_reindex` | Incremental reindex when stale (`full=true` for rebuild) |
+| `cs_reindex` | **Emergency** only (same lock as host ensure) |
 
 Optional `root` on every tool for monorepos (else `CODESCRATCH_ROOT` / cwd).
 
 ### Trust / confidence
 
-- `strong` — same-file or import-binding path
-- `weak` — unique-global-name fallback only (verify)
+- `strong` — a binding or lexical fact. **Never a type check.**
+- `weak` — a name guess. Verify before acting.
+- `rebuilding` — host ensure holds the lock; wait.
 - Unresolved package imports stay open
+- On `partial` + `hash-checked N/M`: reindex/ensure before trusting absence (only `fresh` = every file hash-compared)
+
+Every resolved edge carries `reason=`:
+
+| reason | conf | means |
+|--------|------|-------|
+| `same-file` | strong | unique non-method symbol in the same file |
+| `import-binding` | strong | followed the import/re-export chain |
+| `namespace-member` | strong | `NS.x` where `NS` is a namespace import |
+| `this-member` | strong | `this.x` → method of the enclosing class |
+| `unique-global` | weak | only one symbol repo-wide has that name |
+| `receiver-unknown` | weak | `recv.x` with no type info — **navigational only** |
+
+`receiver-unknown` is the common case on OO code: the target is whatever unique symbol shares the method name, which may be the wrong class. Read the source before trusting it.
 
 ### Resolve (v0.1+)
 
 - Relative + `tsconfig` paths + workspace package names
-- Dirty incremental: rebind dirty + importers (clears settled call/import edges first)
-- Stale detection = content hash sample, not mtime
+- Dirty incremental: rebind dirty + importers; orphaned edges swept
+- Host `ensure`: single-flight lock, pending coalesce, `indexed_head` meta (HEAD change → one incremental job, not full thrash)
+- Stale detection: mtime+size gate + content hash; HEAD drift → stale
 
 ### Extractor misses (v1)
 
@@ -42,18 +72,18 @@ Optional `root` on every tool for monorepos (else `CODESCRATCH_ROOT` / cwd).
 - object-literal methods only partial
 - JSX component identity syntactic only
 
-
-
 ## Layout
 
 ```
 src/
   extract/     tree-sitter TS/JS + import bindings
   index/       walk, hash, scoped resolve
+  host/        ensure lock + git HEAD (host freshness)
   query/       explore/search/callers/impact + trust
-  db/          node:sqlite graph (schema v2)
+  db/          node:sqlite graph
   mcp.ts       MCP stdio
-  cli.ts       CLI
+  cli.ts       CLI (ensure | init | reindex | …)
+integrations/claude-code/   SessionStart + PostToolUse hooks
 ```
 
 ## Dev
@@ -62,5 +92,5 @@ src/
 npm install
 npm test
 npm run build
-node dist/cli.js init <path>
+node dist/cli.js ensure <path>
 ```
