@@ -42,10 +42,11 @@ describe("query layer", () => {
     expect(s).toMatch(/trust:/);
   });
 
-  it("callers of add is non-empty", () => {
+  it("callers of add is non-empty and labels conf=", () => {
     const s = listCallers("add", root);
     expect(s).toMatch(/callers of/);
     expect(s.toLowerCase()).toMatch(/double|sum|calculator|usealias/);
+    expect(s).toMatch(/conf=(strong|weak)/);
   });
 
   it("impact up of math.ts lists upstream", () => {

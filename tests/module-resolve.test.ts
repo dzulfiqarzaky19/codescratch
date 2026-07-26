@@ -5,6 +5,8 @@ import {
   cpSync,
   readFileSync,
   writeFileSync,
+  unlinkSync,
+  mkdirSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -232,6 +234,103 @@ describe("incremental dirty rebind", () => {
       expect(t2.trust).not.toBe("stale");
     } finally {
       db.close();
+    }
+  });
+
+  it("deleting math.ts file rebinds importers (no strong sum→add)", async () => {
+    const iso = mkdtempSync(join(tmpdir(), "cs-rmfile-"));
+    try {
+      cpSync(fixtureSrc, iso, { recursive: true });
+      await indexRepo(iso, { full: true });
+
+      let db = GraphDb.open(iso);
+      const addBefore = db
+        .findNodesByName("add")
+        .find((n) => n.file_path.includes("math"));
+      expect(addBefore).toBeTruthy();
+      const oldAddId = addBefore!.id;
+      db.close();
+
+      unlinkSync(join(iso, "src/lib/math.ts"));
+      await indexRepo(iso, { full: false });
+
+      db = GraphDb.open(iso);
+      try {
+        expect(db.getNode(oldAddId)).toBeNull();
+        expect(
+          db.listFiles().some((f) => f.path === "src/lib/math.ts"),
+        ).toBe(false);
+
+        const total = db
+          .nodesInFile("src/services/calc.ts")
+          .find((n) => n.name === "total");
+        expect(total).toBeTruthy();
+        const sumEdges = db
+          .edgesFrom(total!.id, "calls")
+          .filter((e) => e.raw_name === "sum" || e.raw_name === "add");
+        const strongToDead = sumEdges.filter(
+          (e) =>
+            e.resolved &&
+            e.confidence === "strong" &&
+            (e.dst_id === oldAddId ||
+              (e.dst_id != null && db.getNode(e.dst_id)?.name === "add")),
+        );
+        expect(strongToDead.length).toBe(0);
+        expect(
+          sumEdges.filter((e) => e.resolved && e.confidence === "strong")
+            .length,
+        ).toBe(0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(iso, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("named reexport vs plain import", () => {
+  it("plain import binding is not is_reexport; export-from is", async () => {
+    const iso = mkdtempSync(join(tmpdir(), "cs-reexp-"));
+    try {
+      mkdirSync(join(iso, "src"), { recursive: true });
+      writeFileSync(
+        join(iso, "src/math.ts"),
+        `export function add(a: number, b: number) { return a + b; }\n`,
+      );
+      writeFileSync(
+        join(iso, "src/only-import.ts"),
+        `import { add } from "./math.js";\nexport function use(a: number) { return add(a, 1); }\n`,
+      );
+      writeFileSync(
+        join(iso, "src/barrel.ts"),
+        `export { add } from "./math.js";\n`,
+      );
+      await indexRepo(iso, { full: true });
+      const db = GraphDb.open(iso);
+      try {
+        const imp = db
+          .bindingsInFile("src/only-import.ts")
+          .find((b) => b.local_name === "add");
+        expect(imp).toBeTruthy();
+        expect(imp!.is_reexport).toBe(false);
+
+        const re = db
+          .bindingsInFile("src/barrel.ts")
+          .find((b) => b.local_name === "add");
+        expect(re).toBeTruthy();
+        expect(re!.is_reexport).toBe(true);
+
+        // only-import must not be treated as a reexport hop target file
+        const hops = db
+          .bindingsInFile("src/only-import.ts")
+          .filter((b) => b.is_reexport);
+        expect(hops.length).toBe(0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      rmSync(iso, { recursive: true, force: true });
     }
   });
 });

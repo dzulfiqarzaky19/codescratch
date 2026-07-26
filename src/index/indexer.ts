@@ -55,6 +55,7 @@ export async function indexRepo(
     let skipped = 0;
     let removed = 0;
     const dirty: string[] = [];
+    const removedPaths: string[] = [];
     const seen = new Set<string>();
 
     for (const relPath of files) {
@@ -131,6 +132,8 @@ export async function indexRepo(
             is_type_only: b.isTypeOnly,
             is_namespace: b.isNamespace,
             is_star_reexport: b.isStarReexport === true,
+            is_reexport:
+              b.isReexport === true || b.isStarReexport === true,
             line: b.line,
           });
         }
@@ -193,22 +196,30 @@ export async function indexRepo(
       indexed++;
     }
 
+    // Capture importers of removed modules BEFORE cascade wipes bindings/edges.
     for (const [path] of existing) {
-      if (!seen.has(path)) {
-        db.deleteFileCascade(path);
-        removed++;
-        dirty.push(path);
-      }
+      if (!seen.has(path)) removedPaths.push(path);
+    }
+    const importersOfRemoved =
+      removedPaths.length > 0
+        ? db.filesImportingModules(removedPaths)
+        : [];
+
+    for (const path of removedPaths) {
+      db.deleteFileCascade(path);
+      removed++;
     }
 
     db.transaction(() => {
       // Full graph resolve always when full index; on incremental dirty set,
       // full rebind of dirty + importers (clear settled edges first).
-      if (full || dirty.length === 0) {
+      // Removed paths are gone from the DB — still rebind their former importers.
+      if (full || (dirty.length === 0 && removedPaths.length === 0)) {
         resolveEdges(db, root);
       } else {
         resolveEdges(db, root, {
           dirtyFiles: dirty.filter((p) => seen.has(p)),
+          extraRebindFiles: importersOfRemoved,
           fullRebind: true,
         });
       }

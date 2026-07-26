@@ -454,6 +454,7 @@ function extractExport(
           isTypeOnly: text.includes("export type"),
           isNamespace: true,
           isStarReexport: false,
+          isReexport: true,
           line,
         });
       }
@@ -465,6 +466,7 @@ function extractExport(
         isTypeOnly: /^export\s+type\s+\*/.test(text),
         isNamespace: false,
         isStarReexport: true,
+        isReexport: true,
         line,
       });
     }
@@ -490,6 +492,7 @@ function extractExport(
         isTypeOnly: false,
         isNamespace: false,
         isStarReexport: false,
+        isReexport: true,
         line: c.startPosition.row + 1,
       });
       exportedNames.add(localName);

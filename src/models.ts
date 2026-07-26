@@ -57,6 +57,8 @@ export interface ImportBinding {
   is_type_only: boolean;
   is_namespace: boolean;
   is_star_reexport: boolean;
+  /** true for `export { x } from` / `export * from` — not plain imports */
+  is_reexport: boolean;
   line: number;
 }
 
@@ -98,6 +100,8 @@ export interface ExtractedBinding {
   isNamespace: boolean;
   /** `export * from '…'` — all names forwarded from module */
   isStarReexport?: boolean;
+  /** `export { x } from` / star reexport — not a plain import */
+  isReexport?: boolean;
   line: number;
 }
 

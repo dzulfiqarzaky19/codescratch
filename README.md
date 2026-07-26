@@ -35,7 +35,7 @@ Graph: `<repo>/.codescratch/graph.db`
 
 ## Claude Code MCP
 
-**Preferred** (after `npm link` or global install):
+After `npm link` (or global install):
 
 ```json
 {
@@ -49,22 +49,10 @@ Graph: `<repo>/.codescratch/graph.db`
 }
 ```
 
-**Dev checkout without link:**
-
-```json
-{
-  "mcpServers": {
-    "codescratch": {
-      "command": "node",
-      "args": ["D:/dev/projects/codescratch/dist/mcp.js"],
-      "env": { "CODESCRATCH_ROOT": "${workspaceFolder}" }
-    }
-  }
-}
-```
-
 Tools: `cs_status`, `cs_search`, `cs_explore`, `cs_callers`, `cs_callees`, `cs_impact`, `cs_reindex`.  
 Optional `root` on each tool for multi-root workspaces.
+
+Without link: `node /absolute/path/to/codescratch/dist/mcp.js` with the same `env` (not the default recipe).
 
 ## Resolve
 

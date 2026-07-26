@@ -14,6 +14,11 @@ export interface ResolveOptions {
    */
   fullRebind?: boolean;
   dirtyFiles?: string[];
+  /**
+   * Still-present files that must rebind even if not in dirtyFiles
+   * (e.g. importers of deleted modules — deleted paths are already gone).
+   */
+  extraRebindFiles?: string[];
 }
 
 /**
@@ -33,10 +38,16 @@ export function resolveEdges(
   const ctx = buildResolveContext(root, fileSet);
 
   let scope: string[] | undefined;
-  if (opts?.dirtyFiles && opts.dirtyFiles.length > 0) {
-    const dirty = opts.dirtyFiles.filter((p) => fileSet.has(p));
-    const deps = db.filesImportingModules(dirty);
-    scope = [...new Set([...dirty, ...deps])];
+  const hasDirty = opts?.dirtyFiles && opts.dirtyFiles.length > 0;
+  const hasExtra =
+    opts?.extraRebindFiles && opts.extraRebindFiles.length > 0;
+  if (hasDirty || hasExtra) {
+    const dirty = (opts?.dirtyFiles ?? []).filter((p) => fileSet.has(p));
+    const deps = dirty.length > 0 ? db.filesImportingModules(dirty) : [];
+    const extra = (opts?.extraRebindFiles ?? []).filter((p) =>
+      fileSet.has(p),
+    );
+    scope = [...new Set([...dirty, ...deps, ...extra])];
   }
 
   // Correctness: when anything dirty, unresolve call-like edges in scope so
@@ -190,12 +201,12 @@ function resolveExportInModule(
     );
   if (exported.length === 1) return exported[0] ?? null;
 
-  // Named re-export binding: export { add } from './math' stored as binding
-  // with local_name=add, imported_name=add on the barrel file
+  // Named re-export only (`export { x } from`) — never plain imports
   const namedRe = db
     .bindingsInFile(modulePath)
     .filter(
       (b) =>
+        b.is_reexport &&
         !b.is_star_reexport &&
         !b.is_namespace &&
         b.module_path &&
