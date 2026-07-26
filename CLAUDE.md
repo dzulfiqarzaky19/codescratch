@@ -17,10 +17,10 @@ Graph currency is **host** work (`codescratch ensure` + Claude Code hooks), not 
 ### Agent protocol
 
 1. Prefer structural tools over blind grep for “where defined / who calls / blast radius”.
-2. Read `trust:` every reply.
+2. Read all three axes every reply — `trust:` (freshness), `coverage:` (how much was verified), `graph:` (resolution quality).
    - `rebuilding` → host job in flight; **absence ≠ proof**; do not spam reindex.
    - `stale` → host ensure should catch up; `cs_reindex` only if stuck.
-   - `partial` / unresolved / `conf=weak` → do not treat absence as proof.
+   - `coverage: sampled` / `graph: degraded` / `conf=weak` / `fresh but …` → do not treat absence as proof.
 3. **Do not** call `cs_reindex` after every edit or every turn.
 4. Critical paths (auth, money, deletes): verify by reading source. Graph misses dynamic `import()`, DI, proxies.
 
@@ -43,7 +43,7 @@ Optional `root` on every tool for monorepos (else `CODESCRATCH_ROOT` / cwd).
 - `weak` — a name guess. Verify before acting.
 - `rebuilding` — host ensure holds the lock; wait.
 - Unresolved package imports stay open
-- On `partial` + `hash-checked N/M`: reindex/ensure before trusting absence (only `fresh` = every file hash-compared)
+- Axes are orthogonal: `graph: degraded` is normal with external deps and says nothing about freshness; `coverage: sampled` means unread files, not drift
 
 Every resolved edge carries `reason=`:
 
@@ -63,7 +63,7 @@ Every resolved edge carries `reason=`:
 - Relative + `tsconfig` paths + workspace package names
 - Dirty incremental: rebind dirty + importers; orphaned edges swept
 - Host `ensure`: single-flight lock, pending coalesce, `indexed_head` meta (HEAD change → one incremental job, not full thrash)
-- Stale detection: mtime+size gate + content hash; HEAD drift → stale
+- Stale detection: stat-all mtime+size gate → hash suspects first, stop on first drift; quiet files hashed within a byte budget; HEAD drift → stale
 
 ### Extractor misses (v1)
 

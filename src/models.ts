@@ -31,12 +31,18 @@ export type EdgeReason =
   | "unique-global"
   | "receiver-unknown";
 
-export type TrustLevel =
-  | "fresh"
-  | "stale"
-  | "partial"
-  | "missing"
-  | "rebuilding";
+/**
+ * Freshness only: does the graph match the files on disk? Says nothing about
+ * how completely that was checked (`CoverageLevel`) or how well the code
+ * resolved (`GraphQuality`) — three independent axes, three fields.
+ */
+export type TrustLevel = "fresh" | "stale" | "missing" | "rebuilding";
+
+/** How much of the freshness claim was actually verified by content hash. */
+export type CoverageLevel = "exhaustive" | "sampled";
+
+/** Resolution quality of the graph itself — orthogonal to freshness. */
+export type GraphQuality = "ok" | "degraded";
 
 export type ImpactDirection = "up" | "down" | "both";
 
@@ -135,7 +141,14 @@ export interface FileExtraction {
 }
 
 export interface TrustInfo {
+  /** freshness vs disk */
   trust: TrustLevel;
+  /** how thoroughly `trust` was verified */
+  coverage: CoverageLevel;
+  /** files whose content was hashed, and the total considered */
+  files_hashed: number;
+  /** resolution quality — a degraded graph can still be perfectly fresh */
+  graph: GraphQuality;
   indexed_at: string | null;
   last_full_index_at: string | null;
   file_count: number;

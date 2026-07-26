@@ -15,7 +15,7 @@ export function statusReport(rootInput?: string): string {
       `schema: ${db.getMeta("schema_version") ?? "?"}`,
       `last_index_at: ${db.getMeta("last_index_at") ?? "n/a"}`,
       `last_full_index_at: ${db.getMeta("last_full_index_at") ?? "n/a"}`,
-      `trust: ${trust.trust}`,
+      `trust: ${trust.trust}  coverage: ${trust.coverage}  graph: ${trust.graph}`,
       `bindings: ${counts.bindings}`,
       `reindex: ${trust.reindex_cmd}`,
     ].join("\n");

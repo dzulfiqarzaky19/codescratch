@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { GraphDb } from "../db/client.js";
-import type { TrustInfo } from "../models.js";
+import type { GraphQuality, TrustInfo } from "../models.js";
 import { EXTRACTOR_LIMITATIONS } from "../models.js";
 import { graphExists } from "../config.js";
 import {
@@ -12,18 +12,34 @@ import {
 } from "../host/ensure.js";
 import { getHead } from "../host/git.js";
 
-/** Baseline hash sample when mtime says nothing changed. */
-const STALE_SAMPLE_CAP = 80;
-/** Ceiling on files hashed per call — mtime-flagged files come first. */
-const STALE_HASH_CAP = 400;
+/**
+ * Ceiling on files hashed per call. computeTrust runs on every query tool, so
+ * the stat gate does the real work (~15ms for 2000 files) and hashing only
+ * confirms it. Suspects are always hashed; quiet files are extra assurance.
+ */
+const STALE_HASH_CAP = 4000;
+/**
+ * Byte ceiling for hashing quiet files. Measured: 11MB ≈ 570ms, which is too
+ * slow to pay per query for the narrow case of a rewrite that preserved both
+ * mtime and size. Past this, coverage reports `sampled` instead.
+ */
+const HASH_BYTE_BUDGET = 4 * 1024 * 1024;
 /** mtime_ms is a float stored in an INTEGER-affinity column. */
 const MTIME_TOLERANCE_MS = 1;
-/** Weak edges / resolved edges above this → partial (not a single weak stain). */
-const WEAK_RATIO_PARTIAL = 0.08;
-/** Unresolved / all edges above this → partial. */
-const UNRESOLVED_RATIO_PARTIAL = 0.35;
+/** Unique-global weak edges / resolved above this → graph degraded. */
+const WEAK_RATIO_DEGRADED = 0.08;
+/** Unresolved / all edges above this → graph degraded. */
+const UNRESOLVED_RATIO_DEGRADED = 0.35;
 
-export function computeTrust(db: GraphDb): TrustInfo {
+/**
+ * @param opts.hashBudget max files to hash — test/override only; production
+ * callers should omit it and take `STALE_HASH_CAP`.
+ */
+export function computeTrust(
+  db: GraphDb,
+  opts?: { hashBudget?: number },
+): TrustInfo {
+  const hashBudget = opts?.hashBudget ?? STALE_HASH_CAP;
   const counts = db.counts();
   const indexedAt = db.getMeta("last_index_at");
   const lastFull = db.getMeta("last_full_index_at");
@@ -35,6 +51,9 @@ export function computeTrust(db: GraphDb): TrustInfo {
   if (counts.files === 0) {
     return {
       trust: "missing",
+      coverage: "exhaustive",
+      files_hashed: 0,
+      graph: "ok",
       indexed_at: indexedAt,
       last_full_index_at: lastFull,
       file_count: 0,
@@ -53,6 +72,10 @@ export function computeTrust(db: GraphDb): TrustInfo {
     const since = db.getMeta(META_REINDEX_STARTED);
     return {
       trust: "rebuilding",
+      // nothing was verified — the graph is mid-write
+      coverage: "sampled",
+      files_hashed: 0,
+      graph: graphQuality(counts).quality,
       indexed_at: indexedAt,
       last_full_index_at: lastFull,
       file_count: counts.files,
@@ -86,9 +109,9 @@ export function computeTrust(db: GraphDb): TrustInfo {
   const files = db.listFiles();
   let staleFiles = 0;
 
-  // stat every file (no read) so an edit outside the stride sample cannot pass
-  // as fresh; hash only the files that could have changed, plus a baseline
-  // sample to catch same-mtime rewrites.
+  // stat every file (cheap, no read): mtime or size drift makes a file suspect.
+  // Size catches a timestamp-preserving rewrite of a different length; a size
+  // of 0 means a pre-v4 row (unknown), so hash it rather than trust it.
   const suspect: typeof files = [];
   const quiet: typeof files = [];
   for (const f of files) {
@@ -100,8 +123,6 @@ export function computeTrust(db: GraphDb): TrustInfo {
       staleFiles++; // gone or unreadable
       continue;
     }
-    // size catches a timestamp-preserving rewrite of a different length;
-    // size 0 means pre-v4 row (unknown) — hash it rather than trust it
     const sizeChanged = f.size_bytes === 0 || st.size !== f.size_bytes;
     if (
       sizeChanged ||
@@ -113,26 +134,42 @@ export function computeTrust(db: GraphDb): TrustInfo {
     }
   }
 
-  const baseline =
-    quiet.length <= STALE_SAMPLE_CAP
-      ? quiet
-      : pickSample(quiet, STALE_SAMPLE_CAP);
-  const toHash = [...suspect, ...baseline].slice(0, STALE_HASH_CAP);
-  const hashCapped = suspect.length + baseline.length > STALE_HASH_CAP;
+  // Hash suspects first — they are the only files that can prove staleness
+  // cheaply. Then spend what is left of the budget confirming quiet files,
+  // which only catches a rewrite preserving BOTH mtime and size.
+  const quietBudget = Math.max(0, hashBudget - suspect.length);
+  const quietToHash =
+    quiet.length <= quietBudget ? quiet : pickSample(quiet, quietBudget);
+  let hashCapped = quietToHash.length < quiet.length;
+  let hashedCount = 0;
+  let bytesRead = 0;
 
-  for (const f of toHash) {
+  const hashOne = (f: (typeof files)[number]): void => {
     const abs = join(db.root, f.path);
+    hashedCount++;
     if (!existsSync(abs)) {
       staleFiles++;
-      continue;
+      return;
     }
-    // Content hash — a touch without an edit is not stale
     try {
-      const hash = sha256(readFileSync(abs));
-      if (hash !== f.hash) staleFiles++;
+      const buf = readFileSync(abs);
+      bytesRead += buf.byteLength;
+      if (sha256(buf) !== f.hash) staleFiles++;
     } catch {
       staleFiles++;
     }
+  };
+
+  for (const f of suspect) hashOne(f);
+
+  // Already stale, or over the byte budget: stop reading. Every query tool
+  // calls this, so verification past the point of a decision is wasted I/O.
+  for (const f of quietToHash) {
+    if (staleFiles > 0 || bytesRead >= HASH_BYTE_BUDGET) {
+      hashCapped = true;
+      break;
+    }
+    hashOne(f);
   }
 
   if (staleFiles > 0) {
@@ -140,51 +177,28 @@ export function computeTrust(db: GraphDb): TrustInfo {
     notes.push(`${staleFiles} content-changed — host: ${reindexCmd}`);
   }
 
-  // `fresh` is a claim of verification, so it requires having hashed every
-  // file. Anything less is `partial`: mtime+size can miss a rewrite that
-  // preserves both. A note under a `fresh` header does not survive contact
-  // with an agent that reads the level and stops.
-  const exhaustive = !hashCapped && toHash.length === files.length;
+  // Coverage is its own axis: it qualifies how well `trust` was verified and
+  // never downgrades `trust` itself. `fresh + sampled` is an honest statement —
+  // "matches disk as far as we looked" — where a bare `fresh` would overclaim.
+  const exhaustive = !hashCapped && hashedCount === files.length;
   if (!exhaustive) {
-    if (trust === "fresh") trust = "partial";
     notes.push(
-      `hash-checked ${toHash.length}/${files.length} (mtime+size-gated${
-        hashCapped ? `, capped at ${STALE_HASH_CAP}` : ""
-      }; not exhaustive) — unchecked files could have changed silently`,
+      trust === "stale"
+        ? `hash-checked ${hashedCount}/${files.length} — stopped early; drift already proven`
+        : `hash-checked ${hashedCount}/${files.length} (mtime+size-gated${
+            hashCapped ? "; hash budget reached" : ""
+          }) — unchecked files could have changed with mtime and size intact`,
     );
   }
 
-  const unresolvedRatio =
-    counts.edges === 0 ? 0 : counts.unresolved / counts.edges;
-  if (unresolvedRatio > UNRESOLVED_RATIO_PARTIAL) {
-    if (trust !== "stale") trust = "partial";
-    notes.push(
-      `unresolved edge ratio ${(unresolvedRatio * 100).toFixed(0)}% — packages/dynamic may be missing`,
-    );
-  } else if (counts.unresolved > 0) {
-    notes.push(
-      `${counts.unresolved} unresolved edges — absence ≠ no reference`,
-    );
-  }
-
-  const resolved = Math.max(0, counts.edges - counts.unresolved);
-  // Receiver-unknown is a same-file member guess and is expected on OO code;
-  // only the cross-file unique-global guess should push trust to partial.
-  const globalGuess = Math.max(0, counts.weak - counts.weak_receiver_unknown);
-  const weakRatio = resolved === 0 ? 0 : globalGuess / resolved;
-  if (counts.weak > 0) {
-    notes.push(
-      `weak edges: ${counts.weak}/${resolved || 0} resolved ` +
-        `(${counts.weak_receiver_unknown} receiver-unknown, ${globalGuess} unique-global ` +
-        `= ${(weakRatio * 100).toFixed(0)}% of resolved) — verify before refactoring`,
-    );
-    if (trust === "fresh" && weakRatio >= WEAK_RATIO_PARTIAL) {
-      trust = "partial";
-    }
-  }
+  const quality = graphQuality(counts);
+  notes.push(...quality.notes);
 
   return {
     trust,
+    coverage: exhaustive ? "exhaustive" : "sampled",
+    files_hashed: hashedCount,
+    graph: quality.quality,
     indexed_at: indexedAt,
     last_full_index_at: lastFull,
     file_count: counts.files,
@@ -195,6 +209,48 @@ export function computeTrust(db: GraphDb): TrustInfo {
     notes,
     reindex_cmd: reindexCmd,
   };
+}
+
+/**
+ * Resolution quality, independent of freshness. A repo importing external
+ * packages is permanently `degraded` — that is a true statement about the
+ * graph, and keeping it off the freshness axis is the point of the split.
+ */
+function graphQuality(counts: ReturnType<GraphDb["counts"]>): {
+  quality: GraphQuality;
+  notes: string[];
+} {
+  const notes: string[] = [];
+  let quality: GraphQuality = "ok";
+
+  const unresolvedRatio =
+    counts.edges === 0 ? 0 : counts.unresolved / counts.edges;
+  if (unresolvedRatio > UNRESOLVED_RATIO_DEGRADED) {
+    quality = "degraded";
+    notes.push(
+      `unresolved edge ratio ${(unresolvedRatio * 100).toFixed(0)}% — packages/dynamic may be missing`,
+    );
+  } else if (counts.unresolved > 0) {
+    notes.push(
+      `${counts.unresolved} unresolved edges — absence ≠ no reference`,
+    );
+  }
+
+  const resolved = Math.max(0, counts.edges - counts.unresolved);
+  // receiver-unknown is a same-file member guess and expected on OO code; only
+  // the cross-file unique-global guess signals a degraded graph
+  const globalGuess = Math.max(0, counts.weak - counts.weak_receiver_unknown);
+  const weakRatio = resolved === 0 ? 0 : globalGuess / resolved;
+  if (counts.weak > 0) {
+    notes.push(
+      `weak edges: ${counts.weak}/${resolved || 0} resolved ` +
+        `(${counts.weak_receiver_unknown} receiver-unknown, ${globalGuess} unique-global ` +
+        `= ${(weakRatio * 100).toFixed(0)}% of resolved) — verify before refactoring`,
+    );
+    if (weakRatio >= WEAK_RATIO_DEGRADED) quality = "degraded";
+  }
+
+  return { quality, notes };
 }
 
 /** Full notes for cs_status only. */

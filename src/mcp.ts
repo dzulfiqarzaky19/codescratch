@@ -40,7 +40,7 @@ const server = new McpServer({
 
 server.tool(
   "cs_status",
-  "Index health: trust, counts, staleness, exact reindex command. Call first if unsure whether the graph exists.",
+  "Index health: trust (freshness), coverage (how much was hash-verified), graph (resolution quality), counts, exact ensure command. Call first if unsure whether the graph exists.",
   { root: rootParam },
   async ({ root }) => {
     try {
