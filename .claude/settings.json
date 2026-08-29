@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd \"/home/dzulfiqarzaky/projects/not mine/codegraph\" && find . -maxdepth 2 -not -path '*/node_modules*' -not -path '*/.git*' | sort)",
+      "Read(//home/dzulfiqarzaky/projects/not mine/codegraph/**)",
+      "Bash(cd \"/home/dzulfiqarzaky/projects/not mine/GitNexus\" && echo \"=== ROOT ===\" && ls -la && echo \"=== find package.json / Cargo.toml ===\" && find . -maxdepth 2 -name \"package.json\" -o -maxdepth 2 -name \"Cargo.toml\" 2>/dev/null | grep -v node_modules && echo \"=== top-level dirs ===\" && find . -maxdepth 2 -type d | grep -v node_modules | grep -v \"\\\\.git\")",
+      "Read(//home/dzulfiqarzaky/projects/not mine/GitNexus/**)",
+      "Bash(cd \"/home/dzulfiqarzaky/projects/not mine/codegraph\" && find . -maxdepth 3 -not -path '*/node_modules*' -not -path '*/.git*' -type d | sort)",
+      "Bash(cd \"/home/dzulfiqarzaky/projects/not mine/codegraph\" && cat package.json)",
+      "Bash(cd \"/home/dzulfiqarzaky/projects/not mine/GitNexus\" && find . -maxdepth 2 -type d | grep -v node_modules | grep -v \"^\\\\./\\\\.\" )",
+      "Bash(cd \"/home/dzulfiqarzaky/projects/not mine/GitNexus\" && find . -maxdepth 3 -type d -name \"packages\" -o -maxdepth 3 -type d -name \"apps\" -o -maxdepth 3 -type d -name \"src\" | grep -v node_modules)",
+      "Bash(cd \"/home/dzulfiqarzaky/projects/not mine/GitNexus/gitnexus/src\" && find . -maxdepth 2 -type d | sort)",
+      "Read(//home/dzulfiqarzaky/projects/not mine/GitNexus/gitnexus/src/**)",
+      "Bash(cd \"/home/dzulfiqarzaky/projects/not mine/codegraph\" && find src/mcp -type f | sort && echo --- && wc -l src/mcp/*.ts 2>/dev/null)",
+      "Bash(cd \"/home/dzulfiqarzaky/projects/not mine/codegraph\" && find src/sync -type f | sort && echo --- && wc -l src/sync/*.ts 2>/dev/null)",
+      "Bash(cd \"/home/dzulfiqarzaky/projects/not mine/GitNexus\" && du -sh gitnexus/src gitnexus-web/src gitnexus-shared/src 2>/dev/null && echo \"---file counts---\" && find gitnexus/src -name \"*.ts\" | wc -l && find gitnexus-web/src -type f | wc -l && find gitnexus-shared/src -type f | wc -l)",
+      "Bash(cd \"/home/dzulfiqarzaky/projects/not mine/codegraph\" && find src/resolution -type f | sort)",
+      "Bash(cd \"/home/dzulfiqarzaky/projects/not mine/codegraph\" && find src/extraction -type f | sort)"
+    ]
+  }
+}

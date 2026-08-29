@@ -74,23 +74,28 @@ Every resolved edge carries `reason=`:
 
 ## Layout
 
+Single Rust crate (`Cargo.toml` at repo root; the original TS port has been removed).
+
 ```
 src/
-  extract/     tree-sitter TS/JS + import bindings
-  index/       walk, hash, scoped resolve
-  host/        ensure lock + git HEAD (host freshness)
-  query/       explore/search/callers/impact + trust
-  db/          node:sqlite graph
-  mcp.ts       MCP stdio
-  cli.ts       CLI (ensure | init | reindex | …)
-integrations/claude-code/   SessionStart + PostToolUse hooks
+  extract/     tree-sitter TS/JS/Python + import bindings (plugins/ for route frameworks)
+  index.rs     walk, hash, scoped resolve, incremental dirty-gate
+  host.rs      ensure/reindex lock + git HEAD (host freshness)
+  query.rs     explore/search/status + trust; hybrid search via embeddings.rs
+  analysis.rs  communities (label propagation) + processes (call chains)
+  embeddings.rs  local feature-hash embeddings + RRF hybrid search
+  group.rs     multi-repo groups (~/.codescratch/groups.json)
+  db.rs        rusqlite graph (bundled build → static, FTS5)
+  mcp.rs       MCP stdio
+  main.rs      CLI (init | ensure | reindex | status | explore | search | mcp | setup | watch | changes | group)
+tests/         golden.sh (e2e) + bench.sh (perf harness)
 ```
 
 ## Dev
 
 ```
-npm install
-npm test
-npm run build
-node dist/cli.js ensure <path>
+cargo test
+cargo build
+cargo build --release
+./target/debug/codescratch ensure <path>
 ```
