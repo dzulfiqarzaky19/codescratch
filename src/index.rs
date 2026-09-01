@@ -1,10 +1,9 @@
-//! Walk → hash → extract → store. v0.1 does a full rebuild each `ensure`
-//! (correct and simple). Incremental dirty+importers is v0.2 (RUST-REWRITE.md).
+//! Walk → hash → extract → store. `ensure` dirty-gates then full-rebuilds;
+//! per-file dirty ∪ importers is not this module (RUST-REWRITE.md).
 
 use crate::model::{Edge, FileFacts, RouteFact, Symbol};
-use crate::{extract, resolve};
+use crate::{extract, resolve, walk};
 use anyhow::Result;
-use ignore::WalkBuilder;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -37,23 +36,31 @@ pub fn index_all(conn: &mut Connection, root: &Path) -> Result<()> {
     }
 
     let cfg = resolve::load_config(root, &files_set);
-    let mut edges = resolve::resolve_with(&symbols, &calls, &bindings, &files_set, &cfg);
-
+    let mut heritage: Vec<Edge> = Vec::new();
     let mut extra: Vec<Edge> = Vec::new();
     let mut routes: Vec<RouteFact> = Vec::new();
     for s in &scanned {
-        extra.extend(extract::extra_ast_edges(&s.path, &s.src, &s.facts));
+        heritage.extend(s.facts.heritage.iter().cloned());
         extra.extend(extract::heuristics::extra_edges(&s.path, &s.src, &s.facts));
         routes.extend(extract::plugins::collect(&s.path, &s.src));
     }
+    let mut edges =
+        resolve::resolve_with_heritage(&symbols, &calls, &bindings, &heritage, &files_set, &cfg);
     for r in &mut routes {
-        if let Some(name) = r.handler_id.split('#').nth(1).and_then(|s| s.split('@').next()) {
-            if let Some(sym) = symbols.iter().find(|s| s.name == name && s.file_path == r.file_path) {
+        if let Some(name) = r
+            .handler_id
+            .split('#')
+            .nth(1)
+            .and_then(|s| s.split('@').next())
+        {
+            if let Some(sym) = symbols
+                .iter()
+                .find(|s| s.name == name && s.file_path == r.file_path)
+            {
                 r.handler_id = sym.id.clone();
             }
         }
     }
-    resolve_heritage(&mut extra, &symbols);
     edges.extend(extra);
 
     let now = now_ms();
@@ -79,15 +86,21 @@ pub fn index_all(conn: &mut Connection, root: &Path) -> Result<()> {
         )?;
         for sym in &symbols {
             nstmt.execute((
-                &sym.id, &sym.kind, &sym.name, &sym.qualified_name, &sym.file_path,
-                sym.start_line as i64, sym.end_line as i64, sym.exported as i64, &sym.signature,
+                &sym.id,
+                &sym.kind,
+                &sym.name,
+                &sym.qualified_name,
+                &sym.file_path,
+                sym.start_line as i64,
+                sym.end_line as i64,
+                sym.exported as i64,
+                &sym.signature,
             ))?;
             ftstmt.execute((&sym.name, &sym.qualified_name, &sym.file_path, &sym.id))?;
         }
 
-        let mut astmt = tx.prepare(
-            "INSERT OR REPLACE INTO node_attrs(node_id, key, value) VALUES(?1,?2,?3)",
-        )?;
+        let mut astmt =
+            tx.prepare("INSERT OR REPLACE INTO node_attrs(node_id, key, value) VALUES(?1,?2,?3)")?;
         let mut estmt = tx.prepare(
             "INSERT INTO edges(src_id,dst_id,kind,raw_name,resolved,conf,reason,provenance,file_path,line)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -106,7 +119,12 @@ pub fn index_all(conn: &mut Connection, root: &Path) -> Result<()> {
                 1i64,
                 format!("{} {}", r.method, r.path),
             ))?;
-            ftstmt.execute((&r.path, format!("{} {}", r.method, r.path), &r.file_path, &id))?;
+            ftstmt.execute((
+                &r.path,
+                format!("{} {}", r.method, r.path),
+                &r.file_path,
+                &id,
+            ))?;
             astmt.execute((&id, "method", &r.method))?;
             astmt.execute((&id, "path", &r.path))?;
             estmt.execute((
@@ -127,13 +145,27 @@ pub fn index_all(conn: &mut Connection, root: &Path) -> Result<()> {
             "INSERT INTO bindings(file_path, local_name, source_module, imported_name, kind) VALUES(?1,?2,?3,?4,?5)",
         )?;
         for b in &bindings {
-            bstmt.execute((&b.file_path, &b.local_name, &b.source_module, &b.imported_name, &b.kind))?;
+            bstmt.execute((
+                &b.file_path,
+                &b.local_name,
+                &b.source_module,
+                &b.imported_name,
+                &b.kind,
+            ))?;
         }
 
         for e in &edges {
             estmt.execute((
-                &e.src_id, &e.dst_id, &e.kind, &e.raw_name, e.resolved as i64,
-                &e.conf, &e.reason, &e.provenance, &e.file_path, e.line as i64,
+                &e.src_id,
+                &e.dst_id,
+                &e.kind,
+                &e.raw_name,
+                e.resolved as i64,
+                &e.conf,
+                &e.reason,
+                &e.provenance,
+                &e.file_path,
+                e.line as i64,
             ))?;
         }
     }
@@ -143,40 +175,11 @@ pub fn index_all(conn: &mut Connection, root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_heritage(edges: &mut [Edge], symbols: &[Symbol]) {
-    let mut by_name: HashMap<&str, Vec<&Symbol>> = HashMap::new();
-    for s in symbols {
-        by_name.entry(s.name.as_str()).or_default().push(s);
-    }
-    for e in edges.iter_mut() {
-        if e.kind != "extends" && e.kind != "implements" {
-            continue;
-        }
-        let simple = e.raw_name.rsplit('.').next().unwrap_or(&e.raw_name);
-        if let Some(cands) = by_name.get(simple) {
-            if cands.len() == 1 {
-                e.dst_id = Some(cands[0].id.clone());
-                e.resolved = true;
-                e.conf = "weak".into();
-                e.reason = "unique-global".into();
-            } else if let Some(same) = cands.iter().find(|s| s.file_path == e.file_path) {
-                e.dst_id = Some(same.id.clone());
-                e.resolved = true;
-                e.conf = "strong".into();
-                e.reason = "same-file".into();
-            }
-        }
-    }
-}
-
-/// Incremental update (WP-2B). Sound design: a cheap `mtime`+`size` dirty-gate
-/// short-circuits to a **no-op** when nothing changed — the common `ensure` case
-/// (SessionStart/PostToolUse with untouched files) — and does a full rebuild when
-/// anything changed. Never leaves a partial/desynced graph; per-file scoped
-/// rebuild (dirty ∪ importers + orphan sweep) is a later refinement.
-pub fn index_incremental(conn: &mut Connection, root: &Path, _changed: &[String]) -> Result<()> {
+/// Dirty-gate then full rebuild. Not a scoped incremental: a partial rewrite
+/// would desync edges. No-op when `mtime`+`size` match.
+pub fn ensure_current(conn: &mut Connection, root: &Path) -> Result<()> {
     if !is_dirty(conn, root)? {
-        return Ok(()); // graph already current — skip the re-parse entirely
+        return Ok(());
     }
     index_all(conn, root)
 }
@@ -190,7 +193,11 @@ fn is_dirty(conn: &Connection, root: &Path) -> Result<bool> {
     {
         let mut stmt = conn.prepare("SELECT path, mtime_ms, size FROM files")?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })?;
         for row in rows {
             let (p, m, s) = row?;
@@ -198,68 +205,31 @@ fn is_dirty(conn: &Connection, root: &Path) -> Result<bool> {
         }
     }
 
-    let mut seen = 0usize;
-    for entry in WalkBuilder::new(root).hidden(false).build() {
-        let Ok(entry) = entry else { continue };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(root) else { continue };
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        if rel.starts_with(".codescratch/") || crate::model::Lang::from_path(&rel).is_none() {
-            continue;
-        }
-        seen += 1;
-        let meta = std::fs::metadata(entry.path()).ok();
-        let mtime = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
-        match db_map.get(&rel) {
-            Some(&(m, s)) if m == mtime && s == size => {}
+    let ents = walk::entries(root);
+    for e in &ents {
+        match db_map.get(&e.rel) {
+            Some(&(m, s)) if m == e.mtime_ms && s == e.size => {}
             _ => return Ok(true), // new or modified
         }
     }
     // a file in the DB but no longer on disk → removed → dirty
-    Ok(seen != db_map.len())
+    Ok(ents.len() != db_map.len())
 }
 
 fn scan(root: &Path) -> Vec<Scanned> {
     let mut out = Vec::new();
-    for result in WalkBuilder::new(root).hidden(false).build() {
-        let Ok(entry) = result else { continue };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+    for e in walk::entries(root) {
+        let Ok(src) = std::fs::read_to_string(&e.abs) else {
             continue;
-        }
-        let abs = entry.path();
-        let rel = match abs.strip_prefix(root) {
-            Ok(r) => r.to_string_lossy().replace('\\', "/"),
-            Err(_) => continue,
         };
-        if rel.starts_with(".codescratch/") {
-            continue;
-        }
-        let Some(lang) = crate::model::Lang::from_path(&rel) else { continue };
-        let Ok(src) = std::fs::read_to_string(abs) else { continue };
-        let meta = std::fs::metadata(abs).ok();
-        let mtime_ms = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let size = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
         let hash = blake3::hash(src.as_bytes()).to_hex().to_string();
-        let facts = extract::extract(&rel, &src);
+        let facts = extract::extract(&e.rel, &src);
         out.push(Scanned {
-            path: rel,
+            path: e.rel,
             hash,
-            mtime_ms,
-            size,
-            language: lang.as_str().to_string(),
+            mtime_ms: e.mtime_ms,
+            size: e.size,
+            language: e.lang.as_str().to_string(),
             src,
             facts,
         });
@@ -268,5 +238,8 @@ fn scan(root: &Path) -> Vec<Scanned> {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }

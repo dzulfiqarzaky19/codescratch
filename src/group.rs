@@ -2,8 +2,8 @@
 //! repos (a split monorepo, a set of microservices) as one logical project.
 //! Registry lives at `~/.codescratch/groups.json` — GLOBAL, user-scoped, not
 //! the per-repo `<repo>/.codescratch/` that db.rs owns. This module only
-//! manages the registry and resolves group name → member roots; it does not
-//! index or query anything (cross-repo fan-out is a later WP).
+//! manages the registry and resolves group name → member roots. Fan-out lives
+//! in [`crate::scope::Scope`]; this module never indexes or queries.
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,10 @@ fn default_version() -> u32 {
 
 impl Default for Registry {
     fn default() -> Self {
-        Registry { version: 1, groups: BTreeMap::new() }
+        Registry {
+            version: 1,
+            groups: BTreeMap::new(),
+        }
     }
 }
 
@@ -91,7 +94,6 @@ pub fn load() -> Result<Registry> {
 }
 
 impl Registry {
-
     /// All groups, sorted by name, with their member roots.
     pub fn list(&self) -> Vec<(String, Vec<PathBuf>)> {
         self.groups
@@ -178,7 +180,12 @@ pub fn run(action: &str, group: Option<&str>, root: Option<&Path>) -> Result<Str
 
 /// `run` against an explicit store. Tests drive this with a temp dir instead of
 /// rewriting the process-global `HOME`.
-pub fn run_in(store: &Store, action: &str, group: Option<&str>, root: Option<&Path>) -> Result<String> {
+pub fn run_in(
+    store: &Store,
+    action: &str,
+    group: Option<&str>,
+    root: Option<&Path>,
+) -> Result<String> {
     match action {
         "list" => {
             let reg = store.load()?;
@@ -188,7 +195,11 @@ pub fn run_in(store: &Store, action: &str, group: Option<&str>, root: Option<&Pa
             }
             let mut out = String::new();
             for (name, roots) in groups {
-                out.push_str(&format!("{name} ({} root{})\n", roots.len(), if roots.len() == 1 { "" } else { "s" }));
+                out.push_str(&format!(
+                    "{name} ({} root{})\n",
+                    roots.len(),
+                    if roots.len() == 1 { "" } else { "s" }
+                ));
                 for r in roots {
                     out.push_str(&format!("  {}\n", r.display()));
                 }
@@ -202,7 +213,11 @@ pub fn run_in(store: &Store, action: &str, group: Option<&str>, root: Option<&Pa
             reg.add(group, root)?;
             store.save(&reg)?;
             let n = reg.roots(group)?.len();
-            Ok(format!("added {} to '{group}' ({n} root{} total)", root.display(), if n == 1 { "" } else { "s" }))
+            Ok(format!(
+                "added {} to '{group}' ({n} root{} total)",
+                root.display(),
+                if n == 1 { "" } else { "s" }
+            ))
         }
         "remove" => {
             let group = group.ok_or_else(|| anyhow!("remove requires --group"))?;
@@ -232,7 +247,9 @@ pub fn run_in(store: &Store, action: &str, group: Option<&str>, root: Option<&Pa
                 .collect::<Vec<_>>()
                 .join("\n"))
         }
-        other => Err(anyhow!("unknown group action: {other} (expected list|add|remove|rm-group|roots)")),
+        other => Err(anyhow!(
+            "unknown group action: {other} (expected list|add|remove|rm-group|roots)"
+        )),
     }
 }
 
@@ -244,8 +261,7 @@ mod tests {
     /// A store in its own temp dir. No env mutation, so tests are independent
     /// and safe under the default parallel test runner.
     fn test_store(name: &str) -> Store {
-        let dir = std::env::temp_dir()
-            .join(format!("cs-group-test-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cs-group-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         Store::new(dir)
@@ -254,7 +270,8 @@ mod tests {
     /// A real temp directory to use as a group root (canonicalize needs it
     /// to exist). Caller-unique subdir so parallel tests don't collide.
     fn temp_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("cs-group-test-root-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("cs-group-test-root-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

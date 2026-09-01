@@ -5,6 +5,9 @@
 //!   - `process` nodes: entrypoint→leaf call chains over resolved `calls`
 //!     — ready-made "flows" for the agent to skim instead of walking edges.
 //!
+//! Explore reads these via `member_of` / `step_in` in the routes/processes
+//! section — they are not unpaid index work.
+//!
 //! Both are heuristic aggregations of AST facts, never AST facts themselves:
 //! `provenance` is always `heuristic` here, and `conf` reflects whether any
 //! underlying edge was `weak` (see `aggregate_conf`). `materialize` is
@@ -131,8 +134,12 @@ fn label_propagation_communities(symbol_ids: &[String], calls: &[&CallEdge]) -> 
         if e.src == e.dst {
             continue; // self-calls don't inform clustering
         }
-        adj.entry(e.src.as_str()).or_default().insert(e.dst.as_str());
-        adj.entry(e.dst.as_str()).or_default().insert(e.src.as_str());
+        adj.entry(e.src.as_str())
+            .or_default()
+            .insert(e.dst.as_str());
+        adj.entry(e.dst.as_str())
+            .or_default()
+            .insert(e.src.as_str());
     }
 
     let mut label: BTreeMap<&str, String> =
@@ -264,7 +271,8 @@ fn write_communities(tx: &Connection, communities: &[RawCommunity]) -> Result<()
         "INSERT INTO edges(src_id,dst_id,kind,raw_name,resolved,conf,reason,provenance,file_path,line)
          VALUES(?1,?2,'member_of','',1,?3,'community','heuristic',?4,0)",
     )?;
-    let mut astmt = tx.prepare("INSERT INTO node_attrs(node_id,key,value) VALUES(?1,'community_size',?2)")?;
+    let mut astmt =
+        tx.prepare("INSERT INTO node_attrs(node_id,key,value) VALUES(?1,'community_size',?2)")?;
 
     for (i, c) in communities.iter().enumerate() {
         let id = format!("#community:{i}");
@@ -349,7 +357,9 @@ fn entrypoint_processes(symbol_ids: &[String], calls: &[&CallEdge]) -> Vec<RawPr
         let mut cur = ep;
 
         while steps.len() < PROCESS_MAX_CHAIN {
-            let Some(targets) = out_edges.get(cur) else { break };
+            let Some(targets) = out_edges.get(cur) else {
+                break;
+            };
             // Smallest-id outgoing edge not yet visited (cycle guard), deterministic.
             let Some(&(next, conf)) = targets.iter().find(|(t, _)| !visited.contains(t)) else {
                 break;
@@ -499,11 +509,15 @@ mod tests {
         materialize(&mut conn).unwrap();
 
         let comm_id: String = conn
-            .query_row("SELECT id FROM nodes WHERE kind='community'", [], |r| r.get(0))
+            .query_row("SELECT id FROM nodes WHERE kind='community'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
 
         let mut stmt = conn
-            .prepare("SELECT src_id FROM edges WHERE kind='member_of' AND dst_id=?1 ORDER BY src_id")
+            .prepare(
+                "SELECT src_id FROM edges WHERE kind='member_of' AND dst_id=?1 ORDER BY src_id",
+            )
             .unwrap();
         let members: Vec<String> = stmt
             .query_map([&comm_id], |r| r.get::<_, String>(0))
@@ -513,7 +527,11 @@ mod tests {
 
         assert_eq!(
             members,
-            vec!["f.ts#a@1".to_string(), "f.ts#b@2".to_string(), "f.ts#c@3".to_string()]
+            vec![
+                "f.ts#a@1".to_string(),
+                "f.ts#b@2".to_string(),
+                "f.ts#c@3".to_string()
+            ]
         );
 
         let size: String = conn
@@ -528,7 +546,11 @@ mod tests {
         // `d` is isolated — no community should include it, and only one
         // community should exist overall (the e-chain has no cycle to cluster).
         let comm_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM nodes WHERE kind='community'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE kind='community'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(comm_count, 1);
     }
@@ -548,10 +570,14 @@ mod tests {
             .unwrap();
 
         let mut stmt = conn
-            .prepare("SELECT src_id, line FROM edges WHERE kind='step_in' AND dst_id=?1 ORDER BY line")
+            .prepare(
+                "SELECT src_id, line FROM edges WHERE kind='step_in' AND dst_id=?1 ORDER BY line",
+            )
             .unwrap();
         let steps: Vec<(String, i64)> = stmt
-            .query_map([&proc_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .query_map([&proc_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
@@ -587,16 +613,28 @@ mod tests {
         materialize(&mut conn).unwrap();
 
         let comm_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM nodes WHERE kind='community'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE kind='community'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let proc_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM nodes WHERE kind='process'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM nodes WHERE kind='process'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let member_edges: i64 = conn
-            .query_row("SELECT COUNT(*) FROM edges WHERE kind='member_of'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE kind='member_of'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let step_edges: i64 = conn
-            .query_row("SELECT COUNT(*) FROM edges WHERE kind='step_in'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM edges WHERE kind='step_in'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let attrs: i64 = conn
             .query_row(

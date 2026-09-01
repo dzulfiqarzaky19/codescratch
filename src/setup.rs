@@ -95,7 +95,13 @@ fn opencode_config() -> Option<PathBuf> {
     }
 }
 
-fn merge_mcp(path: &Path, name: &str, bin: &Path, root: &Path, group: Option<&str>) -> Result<bool> {
+fn merge_mcp(
+    path: &Path,
+    name: &str,
+    bin: &Path,
+    root: &Path,
+    group: Option<&str>,
+) -> Result<bool> {
     let mut root_obj: Value = if path.exists() {
         let raw = std::fs::read_to_string(path)?;
         serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
@@ -148,12 +154,28 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("mcp.json");
         fs::write(&p, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
-        merge_mcp(&p, "codescratch", Path::new("/bin/codescratch"), Path::new("/repo"), None).unwrap();
+        merge_mcp(
+            &p,
+            "codescratch",
+            Path::new("/bin/codescratch"),
+            Path::new("/repo"),
+            None,
+        )
+        .unwrap();
         let v: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
         assert!(v["mcpServers"]["other"].is_object());
-        assert_eq!(v["mcpServers"]["codescratch"]["command"], "/bin/codescratch");
+        assert_eq!(
+            v["mcpServers"]["codescratch"]["command"],
+            "/bin/codescratch"
+        );
         assert_eq!(v["mcpServers"]["codescratch"]["args"][0], "mcp");
-        assert_eq!(v["mcpServers"]["codescratch"]["args"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            v["mcpServers"]["codescratch"]["args"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -163,10 +185,19 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("mcp.json");
-        merge_mcp(&p, "codescratch", Path::new("/bin/codescratch"), Path::new("/repo"), Some("svc"))
-            .unwrap();
+        merge_mcp(
+            &p,
+            "codescratch",
+            Path::new("/bin/codescratch"),
+            Path::new("/repo"),
+            Some("svc"),
+        )
+        .unwrap();
         let v: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
-        let args = v["mcpServers"]["codescratch"]["args"].as_array().unwrap().clone();
+        let args = v["mcpServers"]["codescratch"]["args"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(args[2], "--group");
         assert_eq!(args[3], "svc");
         let _ = fs::remove_dir_all(&dir);

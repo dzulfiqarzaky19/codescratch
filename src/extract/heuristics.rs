@@ -15,7 +15,8 @@ pub fn extra_edges(path_rel: &str, src: &str, facts: &FileFacts) -> Vec<Edge> {
 
 /// `foo(cb)` / `foo(() => …)` where `cb` is a same-file function — dispatch edge.
 fn callback_args(file: &str, facts: &FileFacts) -> Vec<Edge> {
-    let names: std::collections::HashSet<&str> = facts.symbols.iter().map(|s| s.name.as_str()).collect();
+    let names: std::collections::HashSet<&str> =
+        facts.symbols.iter().map(|s| s.name.as_str()).collect();
     facts
         .calls
         .iter()
@@ -27,7 +28,10 @@ fn callback_args(file: &str, facts: &FileFacts) -> Vec<Edge> {
             // symbol also calls something else on the same line, skip (too noisy).
             // Conservative: emit only when the callee is a local function used as
             // a *member-less* call from a different enclosing symbol than itself.
-            let callee = facts.symbols.iter().find(|s| s.name == c.name && s.file_path == file)?;
+            let callee = facts
+                .symbols
+                .iter()
+                .find(|s| s.name == c.name && s.file_path == file)?;
             if c.from_id == callee.id {
                 return None;
             }
@@ -184,7 +188,9 @@ class Box {
         let f = extract("src/a.ts", src);
         let edges = extra_edges("src/a.ts", src, &f);
         assert!(
-            edges.iter().any(|e| e.reason == "setState-render" && e.provenance == "heuristic"),
+            edges
+                .iter()
+                .any(|e| e.reason == "setState-render" && e.provenance == "heuristic"),
             "expected setState→render: {edges:?}"
         );
     }

@@ -160,9 +160,8 @@ pub fn materialize(conn: &mut Connection) -> Result<()> {
             "SELECT id, name, qualified_name, file_path, signature FROM nodes
              WHERE kind IN ('function','class','method')",
         )?;
-        let mut ins = tx.prepare(
-            "INSERT OR REPLACE INTO embeddings(node_id, dim, vec) VALUES(?1,?2,?3)",
-        )?;
+        let mut ins =
+            tx.prepare("INSERT OR REPLACE INTO embeddings(node_id, dim, vec) VALUES(?1,?2,?3)")?;
         let rows = sel.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -191,9 +190,9 @@ fn fts_ranked(conn: &Connection, query: &str, limit: usize) -> Vec<String> {
     if !sanitized.is_empty() {
         let sql = "SELECT node_id FROM nodes_fts WHERE nodes_fts MATCH ?1 LIMIT ?2";
         if let Ok(mut stmt) = conn.prepare(sql) {
-            if let Ok(rows) =
-                stmt.query_map(rusqlite::params![sanitized, limit as i64], |r| r.get::<_, String>(0))
-            {
+            if let Ok(rows) = stmt.query_map(rusqlite::params![sanitized, limit as i64], |r| {
+                r.get::<_, String>(0)
+            }) {
                 let ids: Vec<String> = rows.filter_map(|r| r.ok()).collect();
                 if !ids.is_empty() {
                     return ids;
@@ -207,8 +206,10 @@ fn fts_ranked(conn: &Connection, query: &str, limit: usize) -> Vec<String> {
     let sql = "SELECT id FROM nodes WHERE name LIKE ?1 LIMIT ?2";
     conn.prepare(sql)
         .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![like, limit as i64], |r| r.get::<_, String>(0))
-                .map(|it| it.filter_map(|r| r.ok()).collect())
+            stmt.query_map(rusqlite::params![like, limit as i64], |r| {
+                r.get::<_, String>(0)
+            })
+            .map(|it| it.filter_map(|r| r.ok()).collect())
         })
         .unwrap_or_default()
 }
@@ -219,7 +220,13 @@ fn fts_ranked(conn: &Connection, query: &str, limit: usize) -> Vec<String> {
 /// always accepts as an implicit AND query.
 fn sanitize_fts_query(q: &str) -> String {
     q.chars()
-        .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -396,9 +403,21 @@ mod tests {
     #[test]
     fn hybrid_search_ranks_matching_symbols_above_unrelated_ones() {
         let mut conn = setup_db();
-        insert_symbol(&conn, "id1", "getUserById", "getUserById(id)", "src/users.ts");
+        insert_symbol(
+            &conn,
+            "id1",
+            "getUserById",
+            "getUserById(id)",
+            "src/users.ts",
+        );
         insert_symbol(&conn, "id2", "deleteUser", "deleteUser(id)", "src/users.ts");
-        insert_symbol(&conn, "id3", "parseConfig", "parseConfig(path)", "src/config.ts");
+        insert_symbol(
+            &conn,
+            "id3",
+            "parseConfig",
+            "parseConfig(path)",
+            "src/config.ts",
+        );
 
         materialize(&mut conn).unwrap();
 
@@ -423,7 +442,13 @@ mod tests {
     #[test]
     fn hybrid_search_falls_back_to_fts_only_when_no_embeddings() {
         let conn = setup_db();
-        insert_symbol(&conn, "id1", "getUserById", "getUserById(id)", "src/users.ts");
+        insert_symbol(
+            &conn,
+            "id1",
+            "getUserById",
+            "getUserById(id)",
+            "src/users.ts",
+        );
         // materialize() not called — embeddings table stays empty.
         let results = hybrid_search(&conn, "user", 10).unwrap();
         assert_eq!(results, vec!["id1".to_string()]);
@@ -432,10 +457,23 @@ mod tests {
     #[test]
     fn hybrid_search_never_panics_on_weird_query_input() {
         let mut conn = setup_db();
-        insert_symbol(&conn, "id1", "getUserById", "getUserById(id)", "src/users.ts");
+        insert_symbol(
+            &conn,
+            "id1",
+            "getUserById",
+            "getUserById(id)",
+            "src/users.ts",
+        );
         materialize(&mut conn).unwrap();
 
-        for q in ["", "   ", "\"unterminated", "-*:()^", "AND OR NOT", "a".repeat(500).as_str()] {
+        for q in [
+            "",
+            "   ",
+            "\"unterminated",
+            "-*:()^",
+            "AND OR NOT",
+            "a".repeat(500).as_str(),
+        ] {
             let _ = hybrid_search(&conn, q, 10);
         }
     }

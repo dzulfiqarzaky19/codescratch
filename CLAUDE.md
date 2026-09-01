@@ -29,10 +29,8 @@ Graph currency is **host** work (`codescratch ensure` + Claude Code hooks), not 
 | Tool | When |
 |------|------|
 | `cs_status` | Graph missing/stale/rebuilding? |
-| `cs_search` | Find symbol by name |
-| `cs_explore` | One symbol/file: members, calls, callers, imports, **bindings** |
-| `cs_callers` / `cs_callees` | Call edges (resolved; weak labeled) |
-| `cs_impact` | Blast radius: `direction=up\|down\|both` (default up) |
+| `cs_explore` | One symbol: snippet + spine + members + calls + callers + routes/processes. Miss inlines nearby search hits. |
+| `cs_search` | Fuzzy find. CLI always; MCP only if `CODESCRATCH_MCP_TOOLS=search`. |
 | `cs_reindex` | **Emergency** only (same lock as host ensure) |
 
 Optional `root` on every tool for monorepos (else `CODESCRATCH_ROOT` / cwd).

@@ -2,6 +2,7 @@
 //! Single static binary: no Node, no npm, no wasm sidecar, no user-side toolchain.
 
 mod analysis;
+mod blast;
 mod changes;
 mod db;
 mod embeddings;
@@ -17,6 +18,7 @@ mod resolve;
 mod scope;
 mod setup;
 mod trust;
+mod walk;
 mod watch;
 
 use anyhow::Result;
@@ -25,7 +27,11 @@ use scope::Scope;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "codescratch", version, about = "Local code structure graph for AI agents")]
+#[command(
+    name = "codescratch",
+    version,
+    about = "Local code structure graph for AI agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -148,10 +154,18 @@ fn main() -> Result<()> {
         Command::Status { path, group } => {
             println!("{}", scope_of(group, path)?.status()?);
         }
-        Command::Explore { symbol, path, group } => {
+        Command::Explore {
+            symbol,
+            path,
+            group,
+        } => {
             println!("{}", scope_of(group, path)?.explore(&symbol)?);
         }
-        Command::Search { query: q, path, group } => {
+        Command::Search {
+            query: q,
+            path,
+            group,
+        } => {
             println!("{}", scope_of(group, path)?.search(&q)?);
         }
         Command::Mcp { path, group } => {
@@ -170,10 +184,20 @@ fn main() -> Result<()> {
             watch::run(&scope_of(group, path)?)?;
         }
         Command::Changes { path, group } => {
-            println!("{}", scope_of(group, path)?.changes(changes::ChangeSpec::Unstaged)?);
+            println!(
+                "{}",
+                scope_of(group, path)?.changes(changes::ChangeSpec::Unstaged)?
+            );
         }
-        Command::Group { action, group, root } => {
-            println!("{}", group::run(&action, group.as_deref(), root.as_deref())?);
+        Command::Group {
+            action,
+            group,
+            root,
+        } => {
+            println!(
+                "{}",
+                group::run(&action, group.as_deref(), root.as_deref())?
+            );
         }
     }
     Ok(())

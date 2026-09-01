@@ -5,7 +5,9 @@ use crate::plugin::RoutePlugin;
 
 pub struct ExpressPlugin;
 
-const METHODS: &[&str] = &["get", "post", "put", "patch", "delete", "options", "head", "all", "use"];
+const METHODS: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "options", "head", "all", "use",
+];
 
 impl RoutePlugin for ExpressPlugin {
     fn routes(&self, path: &str, src: &str) -> Vec<RouteFact> {
@@ -14,9 +16,13 @@ impl RoutePlugin for ExpressPlugin {
             let ln = i + 1;
             let t = line.trim_start();
             // app.get('/x', handler)  |  router.post("/x", fn)
-            let Some(rest) = strip_receiver_method(t) else { continue };
+            let Some(rest) = strip_receiver_method(t) else {
+                continue;
+            };
             let (method, after) = rest;
-            let Some((route_path, handler)) = split_path_and_handler(after) else { continue };
+            let Some((route_path, handler)) = split_path_and_handler(after) else {
+                continue;
+            };
             let handler_id = crate::model::Symbol::make_id(path, &handler, ln);
             out.push(RouteFact {
                 method: method.to_uppercase(),
@@ -36,7 +42,12 @@ fn strip_receiver_method(t: &str) -> Option<(&str, &str)> {
         let needle = format!(".{m}(");
         if let Some(i) = t.find(&needle) {
             let before = &t[..i];
-            if before.chars().last().map(|c| c.is_ascii_alphanumeric() || c == '_' || c == ')').unwrap_or(false) {
+            if before
+                .chars()
+                .last()
+                .map(|c| c.is_ascii_alphanumeric() || c == '_' || c == ')')
+                .unwrap_or(false)
+            {
                 return Some((m, &t[i + needle.len()..]));
             }
         }
@@ -54,7 +65,10 @@ fn split_path_and_handler(after: &str) -> Option<(String, String)> {
     let end = rest.find(q)?;
     let route = rest[..end].to_string();
     let after_path = rest[end + 1..].trim_start();
-    let after_path = after_path.strip_prefix(',').unwrap_or(after_path).trim_start();
+    let after_path = after_path
+        .strip_prefix(',')
+        .unwrap_or(after_path)
+        .trim_start();
     let handler = handler_name(after_path)?;
     Some((route, handler))
 }
@@ -90,6 +104,8 @@ app.post("/users/:id", (req, res) => {});
 "#;
         let rs = ExpressPlugin.routes("src/app.ts", src);
         assert!(rs.iter().any(|r| r.method == "GET" && r.path == "/users"));
-        assert!(rs.iter().any(|r| r.method == "POST" && r.path == "/users/:id"));
+        assert!(rs
+            .iter()
+            .any(|r| r.method == "POST" && r.path == "/users/:id"));
     }
 }

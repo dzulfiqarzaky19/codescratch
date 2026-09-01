@@ -127,7 +127,10 @@ mod tests {
 
     #[test]
     fn app_page_becomes_get_route() {
-        let rs = NextPlugin.routes("src/app/users/[id]/page.tsx", "export default function Page() {}");
+        let rs = NextPlugin.routes(
+            "src/app/users/[id]/page.tsx",
+            "export default function Page() {}",
+        );
         assert_eq!(rs.len(), 1);
         assert_eq!(rs[0].method, "GET");
         assert_eq!(rs[0].path, "/users/:id");
@@ -137,7 +140,9 @@ mod tests {
     fn route_ts_exports_verbs() {
         let src = "export async function GET() {}\nexport async function POST() {}";
         let rs = NextPlugin.routes("app/api/hello/route.ts", src);
-        assert!(rs.iter().any(|r| r.method == "GET" && r.path == "/api/hello"));
+        assert!(rs
+            .iter()
+            .any(|r| r.method == "GET" && r.path == "/api/hello"));
         assert!(rs.iter().any(|r| r.method == "POST"));
     }
 }

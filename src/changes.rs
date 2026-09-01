@@ -2,12 +2,11 @@
 //! `git diff` → hunk headers → changed line ranges → overlapping symbols
 //! (nodes) → reverse-BFS over `calls` edges for the affected set.
 
-use crate::{db, trust};
+use crate::model::NodeRow;
+use crate::{blast, db, trust};
 use anyhow::Result;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::Path;
-
-const MAX_DEPTH: usize = 3;
 
 /// Which diff to inspect.
 #[allow(dead_code)] // Staged/Compare reserved for `--staged` / `--compare <ref>` CLI flags
@@ -18,15 +17,6 @@ pub enum ChangeSpec {
     Staged,
     /// Working tree vs an arbitrary ref/range (`git diff <ref>`).
     Compare(String),
-}
-
-struct NodeRow {
-    id: String,
-    kind: String,
-    qualified_name: String,
-    file_path: String,
-    start_line: i64,
-    end_line: i64,
 }
 
 /// A changed file's new-side line ranges, `[start, end]` inclusive, 1-based.
@@ -89,7 +79,7 @@ pub fn detect_one(root: &Path, spec: &ChangeSpec) -> Result<Option<String>> {
     }
     changed_rows.sort_by(|a, b| (&a.file_path, a.start_line).cmp(&(&b.file_path, b.start_line)));
 
-    let affected = affected_blast(&conn, &changed_ids, MAX_DEPTH)?;
+    let affected = blast_hops(&conn, &changed_ids)?;
 
     let mut out = String::new();
     out.push_str("## changed\n");
@@ -158,83 +148,28 @@ fn run_git_diff(root: &Path, spec: &ChangeSpec) -> Result<String> {
 }
 
 fn load_nodes(conn: &rusqlite::Connection) -> Result<Vec<NodeRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT id,kind,qualified_name,file_path,start_line,end_line FROM nodes",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(NodeRow {
-                id: r.get(0)?,
-                kind: r.get(1)?,
-                qualified_name: r.get(2)?,
-                file_path: r.get(3)?,
-                start_line: r.get(4)?,
-                end_line: r.get(5)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(rows)
+    Ok(NodeRow::all(conn)?)
 }
 
-/// Reverse-BFS over `edges(kind='calls')`: from each changed node, follow
-/// `dst_id = changed` back to `src_id` (the caller), depth-first-fanning out
-/// up to `max_depth` hops, deduping visited nodes.
-fn affected_blast(
+/// Format adapter over [`blast::from_ids`]: hops with no node are dropped
+/// (module-scope call sites have nothing to name in the changes report).
+fn blast_hops(
     conn: &rusqlite::Connection,
     changed: &HashSet<String>,
-    max_depth: usize,
 ) -> Result<Vec<(usize, NodeRow)>> {
-    let mut seen: HashSet<String> = changed.clone();
-    let mut q: VecDeque<(String, usize)> = changed.iter().map(|id| (id.clone(), 0)).collect();
-    let mut out: Vec<(usize, NodeRow)> = Vec::new();
-
-    let mut stmt = conn.prepare("SELECT src_id FROM edges WHERE dst_id = ?1 AND kind = 'calls'")?;
-
-    while let Some((cur, depth)) = q.pop_front() {
-        if depth >= max_depth {
-            continue;
-        }
-        let callers: Vec<String> = stmt
-            .query_map([&cur], |r| r.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        for caller_id in callers {
-            if !seen.insert(caller_id.clone()) {
-                continue;
-            }
-            let d = depth + 1;
-            if let Some(node) = node_by_id(conn, &caller_id)? {
-                out.push((d, node));
-            }
-            q.push_back((caller_id, d));
-        }
-    }
-
-    out.sort_by(|a, b| {
-        (a.0, &a.1.file_path, a.1.start_line).cmp(&(b.0, &b.1.file_path, b.1.start_line))
+    let seeds: Vec<&str> = changed.iter().map(|s| s.as_str()).collect();
+    let mut hops = blast::from_ids(conn, &seeds, blast::MAX_DEPTH)?;
+    hops.sort_by(|a, b| {
+        let af = a.node.as_ref().map(|n| n.file_path.as_str()).unwrap_or("");
+        let bf = b.node.as_ref().map(|n| n.file_path.as_str()).unwrap_or("");
+        let al = a.node.as_ref().map(|n| n.start_line).unwrap_or(0);
+        let bl = b.node.as_ref().map(|n| n.start_line).unwrap_or(0);
+        (a.depth, af, al).cmp(&(b.depth, bf, bl))
     });
-    Ok(out)
-}
-
-fn node_by_id(conn: &rusqlite::Connection, id: &str) -> Result<Option<NodeRow>> {
-    let row = conn
-        .query_row(
-            "SELECT id,kind,qualified_name,file_path,start_line,end_line FROM nodes WHERE id=?1",
-            [id],
-            |r| {
-                Ok(NodeRow {
-                    id: r.get(0)?,
-                    kind: r.get(1)?,
-                    qualified_name: r.get(2)?,
-                    file_path: r.get(3)?,
-                    start_line: r.get(4)?,
-                    end_line: r.get(5)?,
-                })
-            },
-        )
-        .ok();
-    Ok(row)
+    Ok(hops
+        .into_iter()
+        .filter_map(|h| h.node.map(|n| (h.depth, n)))
+        .collect())
 }
 
 /// Pure: parse a unified diff (as produced by `git diff --unified=0`) into
@@ -337,10 +272,13 @@ mod tests {
         NodeRow {
             id: id.to_string(),
             kind: "function".to_string(),
+            name: id.to_string(),
             qualified_name: id.to_string(),
             file_path: file.to_string(),
             start_line: start,
             end_line: end,
+            exported: true,
+            signature: String::new(),
         }
     }
 

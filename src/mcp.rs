@@ -105,7 +105,12 @@ fn call_tool(scope: &Scope, msg: &Value) -> Result<String> {
     let params = msg.get("params").cloned().unwrap_or(json!({}));
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    let arg = |k: &str| args.get(k).and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let arg = |k: &str| {
+        args.get(k)
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     match name {
         "status" => scope.status(),
         "explore" => scope.explore(&arg("symbol")),

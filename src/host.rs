@@ -30,7 +30,10 @@ pub fn git_head(root: &Path) -> Option<String> {
 }
 
 fn now_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
 }
 
 /// RAII single-flight lock via `O_EXCL` create. Steals a stale lock.
@@ -65,7 +68,12 @@ impl Lock {
         let Ok(body) = fs::read_to_string(path) else {
             return true;
         };
-        match body.trim().split(':').nth(1).and_then(|t| t.parse::<u128>().ok()) {
+        match body
+            .trim()
+            .split(':')
+            .nth(1)
+            .and_then(|t| t.parse::<u128>().ok())
+        {
             Some(ts) => now_ms().saturating_sub(ts) > LOCK_TTL_MS,
             None => true,
         }
@@ -80,7 +88,7 @@ impl Drop for Lock {
 
 /// Bring the graph up to date under the lock. `reindex_state=rebuilding` is set
 /// so concurrent readers report `trust: rebuilding` instead of reading torn data.
-/// The dirty-gate inside `index_incremental` short-circuits to a no-op when
+/// The dirty-gate inside `index::ensure_current` short-circuits to a no-op when
 /// nothing changed (the common SessionStart/PostToolUse case).
 pub fn ensure(root: &Path) -> Result<()> {
     run_under_lock(root, false)
@@ -106,7 +114,11 @@ pub fn ensure_many(roots: &[std::path::PathBuf], force: bool) -> Result<()> {
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("{} repo(s) failed: {}", failures.len(), failures.join("; ")))
+        Err(anyhow::anyhow!(
+            "{} repo(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
+        ))
     }
 }
 
@@ -119,7 +131,7 @@ fn run_under_lock(root: &Path, force: bool) -> Result<()> {
     let result = if force {
         index::index_all(&mut conn, root)
     } else {
-        index::index_incremental(&mut conn, root, &[])
+        index::ensure_current(&mut conn, root)
     };
 
     // Always clear the rebuilding flag, even on failure.

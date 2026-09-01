@@ -3,7 +3,7 @@
 //! pay a full `ensure` per keystroke-adjacent save.
 
 use crate::scope::Scope;
-use crate::{host, model};
+use crate::{host, walk};
 use anyhow::{Context, Result};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
@@ -33,13 +33,8 @@ fn should_flush(pending_count: usize, elapsed_since_first: Duration) -> bool {
     elapsed_since_first >= DEBOUNCE
 }
 
-/// True if a repo-relative path should be tracked: not under `.codescratch/`
-/// or `.git/`, and recognized as a source language.
 fn relevant(rel: &str) -> bool {
-    if rel.starts_with(".codescratch/") || rel.starts_with(".git/") {
-        return false;
-    }
-    model::Lang::from_path(rel).is_some()
+    walk::tracked(rel).is_some()
 }
 
 /// Convert an absolute event path to a repo-relative, forward-slash path.
@@ -88,7 +83,9 @@ pub fn run(scope: &Scope) -> Result<()> {
         match rx.recv_timeout(POLL) {
             Ok(Ok(event)) => {
                 for abs in &event.paths {
-                    let Some((root, rel)) = owning_root(roots, abs) else { continue };
+                    let Some((root, rel)) = owning_root(roots, abs) else {
+                        continue;
+                    };
                     let i = roots.iter().position(|r| r == root).unwrap_or(0);
                     if pending[i].insert(rel) && first_pending_at[i].is_none() {
                         first_pending_at[i] = Some(Instant::now());
@@ -108,7 +105,9 @@ pub fn run(scope: &Scope) -> Result<()> {
         }
 
         for (i, root) in roots.iter().enumerate() {
-            let Some(first) = first_pending_at[i] else { continue };
+            let Some(first) = first_pending_at[i] else {
+                continue;
+            };
             if !should_flush(pending[i].len(), first.elapsed()) {
                 continue;
             }

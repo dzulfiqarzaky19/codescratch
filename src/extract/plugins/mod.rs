@@ -12,5 +12,8 @@ pub fn all() -> Vec<Box<dyn RoutePlugin>> {
 }
 
 pub fn collect(path: &str, src: &str) -> Vec<RouteFact> {
-    all().into_iter().flat_map(|p| p.routes(path, src)).collect()
+    all()
+        .into_iter()
+        .flat_map(|p| p.routes(path, src))
+        .collect()
 }

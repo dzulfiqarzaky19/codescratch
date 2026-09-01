@@ -3,11 +3,12 @@
 //! API is stable across tree-sitter versions; avoids the version-fragile Query
 //! API on purpose).
 
-use crate::model::{FileFacts, ImportBinding, RawCall, Symbol};
+use super::walk::{self, push_binding, Ctx};
+use crate::model::{Edge, FileFacts, RawCall, Symbol};
 use tree_sitter::{Node, Parser};
 
 pub fn extract(path: &str, src: &str) -> FileFacts {
-    let mut facts = FileFacts { symbols: vec![], calls: vec![], imports: vec![] };
+    let mut facts = FileFacts::default();
     let ts_lang: tree_sitter::Language = tree_sitter_python::LANGUAGE.into();
     let mut parser = Parser::new();
     if parser.set_language(&ts_lang).is_err() {
@@ -17,25 +18,19 @@ pub fn extract(path: &str, src: &str) -> FileFacts {
         return facts;
     };
     let bytes = src.as_bytes();
-    let mut ctx = Ctx { file: path, bytes, enclosing: None, class: None, facts: &mut facts };
+    let mut ctx = Ctx {
+        file: path,
+        bytes,
+        enclosing: None,
+        class: None,
+        facts: &mut facts,
+    };
     visit(tree.root_node(), &mut ctx);
     facts
 }
 
-struct Ctx<'a> {
-    file: &'a str,
-    bytes: &'a [u8],
-    enclosing: Option<String>,       // nearest function/method symbol id
-    class: Option<(String, String)>, // (class name, class id)
-    facts: &'a mut FileFacts,
-}
-
-fn text<'a>(n: Node, bytes: &'a [u8]) -> &'a str {
-    n.utf8_text(bytes).unwrap_or("")
-}
-
 fn signature(n: Node, bytes: &[u8]) -> String {
-    let full = text(n, bytes);
+    let full = walk::text(n, bytes);
     let cut = full.find([':', '\n']).unwrap_or(full.len());
     let mut s = full[..cut].trim().to_string();
     if s.len() > 200 {
@@ -56,7 +51,7 @@ fn visit(node: Node, ctx: &mut Ctx) {
                     let qual = ctx
                         .class
                         .as_ref()
-                        .map(|(c, _)| format!("{c}.{}", text(name, ctx.bytes)));
+                        .map(|(c, _)| format!("{c}.{}", walk::text(name, ctx.bytes)));
                     ("method", qual)
                 } else {
                     ("function", None)
@@ -68,18 +63,19 @@ fn visit(node: Node, ctx: &mut Ctx) {
                 // Descend into the body with this def as the new enclosing
                 // symbol; class context is cleared so a def nested inside a
                 // method's body isn't mistaken for another method.
-                recurse_with(node, ctx, Some(id), None);
+                walk::recurse_with(node, ctx, Some(id), None, visit);
                 return;
             }
         }
         "class_definition" => {
             if let Some(name) = node.child_by_field_name("name") {
-                let nm = text(name, ctx.bytes).to_string();
+                let nm = walk::text(name, ctx.bytes).to_string();
                 let exported = ctx.enclosing.is_none() && ctx.class.is_none();
                 let id = push_symbol(ctx, node, name, "class", None, exported);
+                record_heritage(node, ctx, &id);
                 // Descend with this class as context and no enclosing function,
                 // so direct-child defs are recognized as methods.
-                recurse_with(node, ctx, None, Some((nm, id)));
+                walk::recurse_with(node, ctx, None, Some((nm, id)), visit);
                 return;
             }
         }
@@ -104,23 +100,6 @@ fn visit(node: Node, ctx: &mut Ctx) {
     }
 }
 
-fn recurse_with(
-    node: Node,
-    ctx: &mut Ctx,
-    enclosing: Option<String>,
-    class: Option<(String, String)>,
-) {
-    let (pe, pc) = (ctx.enclosing.take(), ctx.class.take());
-    ctx.enclosing = enclosing;
-    ctx.class = class;
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        visit(child, ctx);
-    }
-    ctx.enclosing = pe;
-    ctx.class = pc;
-}
-
 fn push_symbol(
     ctx: &mut Ctx,
     def: Node,
@@ -129,22 +108,15 @@ fn push_symbol(
     qual: Option<String>,
     exported: bool,
 ) -> String {
-    let nm = text(name, ctx.bytes).to_string();
-    let start = def.start_position().row + 1;
-    let end = def.end_position().row + 1;
-    let id = Symbol::make_id(ctx.file, &nm, start);
-    ctx.facts.symbols.push(Symbol {
-        id: id.clone(),
-        kind: kind.to_string(),
-        name: nm.clone(),
-        qualified_name: qual.unwrap_or(nm),
-        file_path: ctx.file.to_string(),
-        start_line: start,
-        end_line: end,
+    walk::push_symbol(
+        ctx,
+        def,
+        name,
+        kind,
+        qual,
         exported,
-        signature: signature(def, ctx.bytes),
-    });
-    id
+        signature(def, ctx.bytes),
+    )
 }
 
 fn record_call(node: Node, ctx: &mut Ctx) {
@@ -152,9 +124,9 @@ fn record_call(node: Node, ctx: &mut Ctx) {
         return;
     };
     let (name, member) = match callee.kind() {
-        "identifier" => (text(callee, ctx.bytes).to_string(), false),
+        "identifier" => (walk::text(callee, ctx.bytes).to_string(), false),
         "attribute" => match callee.child_by_field_name("attribute") {
-            Some(p) => (text(p, ctx.bytes).to_string(), true),
+            Some(p) => (walk::text(p, ctx.bytes).to_string(), true),
             None => return,
         },
         _ => return,
@@ -182,14 +154,18 @@ fn record_import_statement(node: Node, ctx: &mut Ctx) {
     for child in node.children_by_field_name("name", &mut cursor) {
         match child.kind() {
             "dotted_name" => {
-                let module = text(child, ctx.bytes).to_string();
+                let module = walk::text(child, ctx.bytes).to_string();
                 push_binding(ctx, &module, &module, "*", "namespace");
             }
             "aliased_import" => {
-                let Some(name) = child.child_by_field_name("name") else { continue };
-                let Some(alias) = child.child_by_field_name("alias") else { continue };
-                let module = text(name, ctx.bytes).to_string();
-                let local = text(alias, ctx.bytes).to_string();
+                let Some(name) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                let Some(alias) = child.child_by_field_name("alias") else {
+                    continue;
+                };
+                let module = walk::text(name, ctx.bytes).to_string();
+                let local = walk::text(alias, ctx.bytes).to_string();
                 push_binding(ctx, &module, &local, "*", "namespace");
             }
             _ => {}
@@ -203,7 +179,7 @@ fn record_import_from_statement(node: Node, ctx: &mut Ctx) {
     let Some(module_node) = node.child_by_field_name("module_name") else {
         return;
     };
-    let module = text(module_node, ctx.bytes).to_string();
+    let module = walk::text(module_node, ctx.bytes).to_string();
     if module.is_empty() {
         return;
     }
@@ -211,14 +187,18 @@ fn record_import_from_statement(node: Node, ctx: &mut Ctx) {
     for child in node.children_by_field_name("name", &mut cursor) {
         match child.kind() {
             "dotted_name" => {
-                let nm = text(child, ctx.bytes).to_string();
+                let nm = walk::text(child, ctx.bytes).to_string();
                 push_binding(ctx, &module, &nm, &nm, "named");
             }
             "aliased_import" => {
-                let Some(name) = child.child_by_field_name("name") else { continue };
-                let Some(alias) = child.child_by_field_name("alias") else { continue };
-                let orig = text(name, ctx.bytes).to_string();
-                let local = text(alias, ctx.bytes).to_string();
+                let Some(name) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                let Some(alias) = child.child_by_field_name("alias") else {
+                    continue;
+                };
+                let orig = walk::text(name, ctx.bytes).to_string();
+                let local = walk::text(alias, ctx.bytes).to_string();
                 push_binding(ctx, &module, &local, &orig, "named");
             }
             _ => {}
@@ -226,22 +206,41 @@ fn record_import_from_statement(node: Node, ctx: &mut Ctx) {
     }
     // `from M import *` — no `name`-field children to iterate; record explicitly.
     let mut cursor2 = node.walk();
-    if node.children(&mut cursor2).any(|c| c.kind() == "wildcard_import") {
+    if node
+        .children(&mut cursor2)
+        .any(|c| c.kind() == "wildcard_import")
+    {
         push_binding(ctx, &module, "*", "*", "star-reexport");
     }
 }
 
-fn push_binding(ctx: &mut Ctx, module: &str, local: &str, imported: &str, kind: &str) {
-    if local.is_empty() {
+/// `class Cat(Animal, pkg.Pet):` — superclasses live in the `superclasses` field.
+fn record_heritage(node: Node, ctx: &mut Ctx, class_id: &str) {
+    let Some(supers) = node.child_by_field_name("superclasses") else {
         return;
+    };
+    let mut cursor = supers.walk();
+    for child in supers.children(&mut cursor) {
+        let raw = match child.kind() {
+            "identifier" | "attribute" | "dotted_name" => walk::text(child, ctx.bytes),
+            _ => continue,
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        ctx.facts.heritage.push(Edge {
+            src_id: class_id.to_string(),
+            dst_id: None,
+            kind: "extends".into(),
+            raw_name: raw.to_string(),
+            resolved: false,
+            conf: "weak".into(),
+            reason: "unresolved".into(),
+            provenance: "ast".into(),
+            file_path: ctx.file.to_string(),
+            line: child.start_position().row + 1,
+        });
     }
-    ctx.facts.imports.push(ImportBinding {
-        file_path: ctx.file.to_string(),
-        local_name: local.to_string(),
-        source_module: module.to_string(),
-        imported_name: imported.to_string(),
-        kind: kind.to_string(),
-    });
 }
 
 #[cfg(test)]
@@ -266,6 +265,30 @@ def greet(name):
     }
 
     #[test]
+    fn class_heritage_is_collected_in_the_same_walk() {
+        let src = "class Cat(Animal, Pet):\n    pass\n";
+        let f = extract("src/a.py", src);
+        let cat = f.symbols.iter().find(|s| s.name == "Cat").expect("Cat");
+        assert!(
+            f.heritage.iter().any(|e| {
+                e.src_id == cat.id
+                    && e.kind == "extends"
+                    && e.raw_name == "Animal"
+                    && e.provenance == "ast"
+            }),
+            "extends Animal: {:?}",
+            f.heritage
+        );
+        assert!(
+            f.heritage
+                .iter()
+                .any(|e| e.kind == "extends" && e.raw_name == "Pet"),
+            "extends Pet: {:?}",
+            f.heritage
+        );
+    }
+
+    #[test]
     fn class_and_method_qualified_name() {
         let src = r#"
 class Box:
@@ -274,14 +297,16 @@ class Box:
 "#;
         let f = extract("src/a.py", src);
         assert!(
-            f.symbols.iter().any(|s| s.name == "Box" && s.kind == "class" && s.exported),
+            f.symbols
+                .iter()
+                .any(|s| s.name == "Box" && s.kind == "class" && s.exported),
             "class Box: {:?}",
             f.symbols
         );
         assert!(
-            f.symbols.iter().any(|s| s.qualified_name == "Box.open"
-                && s.kind == "method"
-                && !s.exported),
+            f.symbols
+                .iter()
+                .any(|s| s.qualified_name == "Box.open" && s.kind == "method" && !s.exported),
             "method Box.open (not exported): {:?}",
             f.symbols
         );

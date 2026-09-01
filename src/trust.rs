@@ -42,12 +42,13 @@ pub fn compute(conn: &Connection, root: &Path) -> Result<Trust> {
     .to_string();
 
     // --- coverage axis --- (full-rebuild indexer visits every file → exhaustive)
-    let coverage = db::get_meta(conn, "coverage")?
-        .unwrap_or_else(|| "exhaustive".to_string());
+    let coverage = db::get_meta(conn, "coverage")?.unwrap_or_else(|| "exhaustive".to_string());
 
     // --- graph axis --- resolution quality, not freshness
     let resolved: i64 = conn
-        .query_row("SELECT COUNT(*) FROM edges WHERE resolved = 1", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM edges WHERE resolved = 1", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(0);
     let graph = if edges == 0 {
         "ok"
@@ -58,7 +59,14 @@ pub fn compute(conn: &Connection, root: &Path) -> Result<Trust> {
     }
     .to_string();
 
-    Ok(Trust { trust, coverage, graph, files, nodes, edges })
+    Ok(Trust {
+        trust,
+        coverage,
+        graph,
+        files,
+        nodes,
+        edges,
+    })
 }
 
 /// The signature line. Always first.
@@ -160,7 +168,10 @@ mod tests {
 
     #[test]
     fn merge_takes_worst_axis_and_sums_counts() {
-        let m = merge(&[t("fresh", "exhaustive", "ok"), t("stale", "sampled", "degraded")]);
+        let m = merge(&[
+            t("fresh", "exhaustive", "ok"),
+            t("stale", "sampled", "degraded"),
+        ]);
         assert_eq!(m.trust, "stale");
         assert_eq!(m.coverage, "sampled");
         assert_eq!(m.graph, "degraded");
@@ -169,7 +180,10 @@ mod tests {
 
     #[test]
     fn merge_ranks_missing_worst_and_empty_is_missing() {
-        let m = merge(&[t("rebuilding", "exhaustive", "ok"), t("missing", "exhaustive", "ok")]);
+        let m = merge(&[
+            t("rebuilding", "exhaustive", "ok"),
+            t("missing", "exhaustive", "ok"),
+        ]);
         assert_eq!(m.trust, "missing");
         assert_eq!(merge(&[]).trust, "missing");
     }
@@ -184,7 +198,10 @@ mod tests {
     fn omitting_an_unreadable_member_would_hide_it_so_missing_must_be_merged() {
         // Two fresh repos look fresh. Adding the unread member as `missing`
         // is what makes the group banner honest.
-        let fresh = [t("fresh", "exhaustive", "ok"), t("fresh", "exhaustive", "ok")];
+        let fresh = [
+            t("fresh", "exhaustive", "ok"),
+            t("fresh", "exhaustive", "ok"),
+        ];
         assert_eq!(merge(&fresh).trust, "fresh");
         let with_dead = [t("fresh", "exhaustive", "ok"), missing()];
         assert_eq!(merge(&with_dead).trust, "missing");
