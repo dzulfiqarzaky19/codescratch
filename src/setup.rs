@@ -6,22 +6,22 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-pub fn run(root: &Path) -> Result<()> {
+pub fn run(root: &Path, group: Option<&str>) -> Result<()> {
     let bin = current_bin()?;
     let mut wrote = Vec::new();
 
     if let Some(p) = claude_config() {
-        if merge_mcp(&p, "codescratch", &bin, root)? {
+        if merge_mcp(&p, "codescratch", &bin, root, group)? {
             wrote.push(p);
         }
     }
     if let Some(p) = cursor_config() {
-        if merge_mcp(&p, "codescratch", &bin, root)? {
+        if merge_mcp(&p, "codescratch", &bin, root, group)? {
             wrote.push(p);
         }
     }
     if let Some(p) = opencode_config() {
-        if merge_mcp(&p, "codescratch", &bin, root)? {
+        if merge_mcp(&p, "codescratch", &bin, root, group)? {
             wrote.push(p);
         }
     }
@@ -32,19 +32,22 @@ pub fn run(root: &Path) -> Result<()> {
             .map(PathBuf::from)
             .map(|h| h.join("mcp.json"))
             .unwrap_or(codex);
-        if merge_mcp(&p, "codescratch", &bin, root)? {
+        if merge_mcp(&p, "codescratch", &bin, root, group)? {
             wrote.push(p);
         }
     }
 
     // Always write a project-local .mcp.json so any agent can pick it up.
     let local = root.join(".mcp.json");
-    merge_mcp(&local, "codescratch", &bin, root)?;
+    merge_mcp(&local, "codescratch", &bin, root, group)?;
     wrote.push(local);
 
     println!("codescratch setup");
     println!("  binary: {}", bin.display());
     println!("  root:   {}", root.display());
+    if let Some(g) = group {
+        println!("  group:  {g} (server fans out over its repos)");
+    }
     for p in &wrote {
         println!("  wrote:  {}", p.display());
     }
@@ -92,7 +95,7 @@ fn opencode_config() -> Option<PathBuf> {
     }
 }
 
-fn merge_mcp(path: &Path, name: &str, bin: &Path, root: &Path) -> Result<bool> {
+fn merge_mcp(path: &Path, name: &str, bin: &Path, root: &Path, group: Option<&str>) -> Result<bool> {
     let mut root_obj: Value = if path.exists() {
         let raw = std::fs::read_to_string(path)?;
         serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
@@ -112,9 +115,16 @@ fn merge_mcp(path: &Path, name: &str, bin: &Path, root: &Path) -> Result<bool> {
     if root_obj.get(mcp_servers).is_none() {
         root_obj[mcp_servers] = json!({});
     }
+    // `--group` makes every served tool fan out over the group's repos; the
+    // root stays as the fallback scope when the group is later removed.
+    let mut args: Vec<String> = vec!["mcp".into(), root.to_string_lossy().into_owned()];
+    if let Some(g) = group {
+        args.push("--group".into());
+        args.push(g.to_string());
+    }
     let entry = json!({
         "command": bin.to_string_lossy(),
-        "args": ["mcp", root.to_string_lossy().as_ref()],
+        "args": args,
     });
     root_obj[mcp_servers][name] = entry;
 
@@ -138,10 +148,27 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let p = dir.join("mcp.json");
         fs::write(&p, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
-        merge_mcp(&p, "codescratch", Path::new("/bin/codescratch"), Path::new("/repo")).unwrap();
+        merge_mcp(&p, "codescratch", Path::new("/bin/codescratch"), Path::new("/repo"), None).unwrap();
         let v: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
         assert!(v["mcpServers"]["other"].is_object());
         assert_eq!(v["mcpServers"]["codescratch"]["command"], "/bin/codescratch");
+        assert_eq!(v["mcpServers"]["codescratch"]["args"][0], "mcp");
+        assert_eq!(v["mcpServers"]["codescratch"]["args"].as_array().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_with_group_appends_group_flag() {
+        let dir = std::env::temp_dir().join(format!("cs-setup-group-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("mcp.json");
+        merge_mcp(&p, "codescratch", Path::new("/bin/codescratch"), Path::new("/repo"), Some("svc"))
+            .unwrap();
+        let v: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
+        let args = v["mcpServers"]["codescratch"]["args"].as_array().unwrap().clone();
+        assert_eq!(args[2], "--group");
+        assert_eq!(args[3], "svc");
         let _ = fs::remove_dir_all(&dir);
     }
 }

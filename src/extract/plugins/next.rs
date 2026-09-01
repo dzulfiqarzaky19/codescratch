@@ -6,9 +6,6 @@ use crate::plugin::RoutePlugin;
 pub struct NextPlugin;
 
 impl RoutePlugin for NextPlugin {
-    fn name(&self) -> &str {
-        "next"
-    }
     fn routes(&self, path: &str, src: &str) -> Vec<RouteFact> {
         let Some(route_path) = file_to_route(path) else {
             return vec![];

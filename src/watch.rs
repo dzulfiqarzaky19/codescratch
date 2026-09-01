@@ -2,11 +2,12 @@
 //! events into a debounced `host::ensure`, so an interactive session doesn't
 //! pay a full `ensure` per keystroke-adjacent save.
 
+use crate::scope::Scope;
 use crate::{host, model};
 use anyhow::{Context, Result};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -49,10 +50,22 @@ fn to_repo_relative(root: &Path, abs: &Path) -> Option<String> {
     Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
-/// Watch `root` recursively and keep the graph fresh via debounced
-/// `host::ensure` calls. Runs until interrupted (Ctrl-C) or the watcher
-/// channel closes.
-pub fn run(root: &Path) -> Result<()> {
+/// Which repo in scope an absolute event path belongs to, and its repo-relative
+/// path. Returns `None` when the path is under no watched root, or is a file we
+/// don't track. With one root this is the old single-repo behaviour.
+fn owning_root<'a>(roots: &'a [PathBuf], abs: &Path) -> Option<(&'a PathBuf, String)> {
+    roots.iter().find_map(|root| {
+        let rel = to_repo_relative(root, abs)?;
+        relevant(&rel).then_some((root, rel))
+    })
+}
+
+/// Watch every repo in `scope` recursively and keep each graph fresh via
+/// debounced `host::ensure` calls. Pending edits are tracked per repo, so a
+/// burst in one repo never triggers an `ensure` in a quiet sibling. Runs until
+/// interrupted (Ctrl-C) or the watcher channel closes.
+pub fn run(scope: &Scope) -> Result<()> {
+    let roots = scope.roots();
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
     // `mpsc::Sender<notify::Result<Event>>` implements `EventHandler`
@@ -60,25 +73,25 @@ pub fn run(root: &Path) -> Result<()> {
     let mut watcher: RecommendedWatcher =
         notify::recommended_watcher(tx).context("failed to create filesystem watcher")?;
 
-    watcher
-        .watch(root, RecursiveMode::Recursive)
-        .with_context(|| format!("failed to watch {}", root.display()))?;
+    for root in roots {
+        watcher
+            .watch(root, RecursiveMode::Recursive)
+            .with_context(|| format!("failed to watch {}", root.display()))?;
+        eprintln!("watching {} for changes (ctrl-c to stop)", root.display());
+    }
 
-    eprintln!("watching {} for changes (ctrl-c to stop)", root.display());
-
-    let mut pending: HashSet<String> = HashSet::new();
-    let mut first_pending_at: Option<Instant> = None;
+    // Per-repo pending sets: repo index → changed repo-relative paths.
+    let mut pending: Vec<HashSet<String>> = vec![HashSet::new(); roots.len()];
+    let mut first_pending_at: Vec<Option<Instant>> = vec![None; roots.len()];
 
     loop {
         match rx.recv_timeout(POLL) {
             Ok(Ok(event)) => {
                 for abs in &event.paths {
-                    let Some(rel) = to_repo_relative(root, abs) else { continue };
-                    if !relevant(&rel) {
-                        continue;
-                    }
-                    if pending.insert(rel) && first_pending_at.is_none() {
-                        first_pending_at = Some(Instant::now());
+                    let Some((root, rel)) = owning_root(roots, abs) else { continue };
+                    let i = roots.iter().position(|r| r == root).unwrap_or(0);
+                    if pending[i].insert(rel) && first_pending_at[i].is_none() {
+                        first_pending_at[i] = Some(Instant::now());
                     }
                 }
             }
@@ -94,15 +107,25 @@ pub fn run(root: &Path) -> Result<()> {
             }
         }
 
-        if let Some(first) = first_pending_at {
-            if should_flush(pending.len(), first.elapsed()) {
-                let n = pending.len();
-                eprintln!("\u{21bb} {n} file{} changed \u{2192} ensure", if n == 1 { "" } else { "s" });
-                pending.clear();
-                first_pending_at = None;
-                if let Err(e) = host::ensure(root) {
-                    eprintln!("ensure failed: {e}");
-                }
+        for (i, root) in roots.iter().enumerate() {
+            let Some(first) = first_pending_at[i] else { continue };
+            if !should_flush(pending[i].len(), first.elapsed()) {
+                continue;
+            }
+            let n = pending[i].len();
+            let where_ = if roots.len() > 1 {
+                format!(" in {}", crate::query::repo_label(root))
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "\u{21bb} {n} file{} changed{where_} \u{2192} ensure",
+                if n == 1 { "" } else { "s" }
+            );
+            pending[i].clear();
+            first_pending_at[i] = None;
+            if let Err(e) = host::ensure(root) {
+                eprintln!("ensure failed: {e}");
             }
         }
     }
@@ -165,5 +188,21 @@ mod tests {
         let root = Path::new("/repo");
         let abs = Path::new("/other/main.ts");
         assert_eq!(to_repo_relative(root, abs), None);
+    }
+
+    #[test]
+    fn owning_root_picks_the_repo_containing_the_path() {
+        let roots = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        let (root, rel) = owning_root(&roots, Path::new("/b/src/x.ts")).unwrap();
+        assert_eq!(root, &PathBuf::from("/b"));
+        assert_eq!(rel, "src/x.ts");
+    }
+
+    #[test]
+    fn owning_root_none_for_untracked_or_outside_paths() {
+        let roots = vec![PathBuf::from("/a")];
+        assert!(owning_root(&roots, Path::new("/elsewhere/x.ts")).is_none());
+        assert!(owning_root(&roots, Path::new("/a/README.md")).is_none());
+        assert!(owning_root(&roots, Path::new("/a/.git/HEAD")).is_none());
     }
 }

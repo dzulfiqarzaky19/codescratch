@@ -55,25 +55,94 @@ pub fn status(root: &Path) -> Result<String> {
     Ok(trust::banner(&t))
 }
 
+/// Short repo label for group output: the root directory name.
+pub fn repo_label(root: &Path) -> String {
+    root.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| root.display().to_string())
+}
+
+/// One repo's status without the banner formatting, so group callers can fold
+/// the axes themselves (worst-wins) instead of concatenating banners.
+pub fn trust_of(root: &Path) -> Result<trust::Trust> {
+    let conn = db::open(root)?;
+    trust::compute(&conn, root)
+}
+
+/// Trust for a member, or [`trust::missing`] if the index cannot be read.
+/// Group callers must use this so a dead repo cannot hide behind the rest.
+fn trust_or_missing(root: &Path) -> (trust::Trust, Option<String>) {
+    match trust_of(root) {
+        Ok(t) => (t, None),
+        Err(e) => (trust::missing(), Some(e.to_string())),
+    }
+}
+
+/// Fan-out status: one merged banner + one line per member repo.
+pub fn status_group(roots: &[std::path::PathBuf]) -> Result<String> {
+    let mut parts = Vec::new();
+    let mut lines = String::new();
+    for root in roots {
+        let label = repo_label(root);
+        let (t, err) = trust_or_missing(root);
+        match err {
+            None => lines.push_str(&format!("- {label}: {}\n", trust::banner(&t))),
+            Some(e) => lines.push_str(&format!("- {label}: unavailable ({e})\n")),
+        }
+        parts.push(t);
+    }
+    Ok(trust::render_group(&parts, roots.len(), &lines))
+}
+
 pub fn search(root: &Path, q: &str) -> Result<String> {
     let conn = db::open(root)?;
     let t = trust::compute(&conn, root)?;
     let mut out = trust::banner(&t);
     out.push_str("\n\n");
+    out.push_str(&search_body(&conn, q, None)?);
+    Ok(out)
+}
 
-    // Hybrid: RRF-fuse FTS with local embedding similarity. Falls back to
-    // FTS-only when the embeddings table is empty (see embeddings.rs).
-    let ids = crate::embeddings::hybrid_search(&conn, q, 25)?;
-
-    if ids.is_empty() {
-        out.push_str(&format!("no symbol matching `{q}`."));
-        return Ok(out);
+/// Fan-out search: every member repo is queried, hits are prefixed with the
+/// repo label. Ranking stays per-repo (scores are not comparable across
+/// separate FTS/embedding indexes).
+pub fn search_group(roots: &[std::path::PathBuf], q: &str) -> Result<String> {
+    let mut parts = Vec::new();
+    let mut body = String::new();
+    for root in roots {
+        let label = repo_label(root);
+        let (t, err) = trust_or_missing(root);
+        parts.push(t);
+        if let Some(e) = err {
+            body.push_str(&format!("- {label}: unavailable ({e})\n"));
+            continue;
+        }
+        match db::open(root).and_then(|conn| search_body(&conn, q, Some(&label))) {
+            Ok(s) => body.push_str(&s),
+            Err(e) => body.push_str(&format!("- {label}: error ({e})\n")),
+        }
     }
+    Ok(trust::render_group(&parts, roots.len(), &body))
+}
+
+/// Shared hit list for both single-repo and group search.
+/// Hybrid: RRF-fuse FTS with local embedding similarity. Falls back to
+/// FTS-only when the embeddings table is empty (see embeddings.rs).
+fn search_body(conn: &Connection, q: &str, label: Option<&str>) -> Result<String> {
+    let ids = crate::embeddings::hybrid_search(conn, q, 25)?;
+    let prefix = label.map(|l| format!("[{l}] ")).unwrap_or_default();
+    if ids.is_empty() {
+        return Ok(match label {
+            Some(l) => format!("[{l}] no symbol matching `{q}`.\n"),
+            None => format!("no symbol matching `{q}`."),
+        });
+    }
+    let mut out = String::new();
     for id in ids {
-        if let Some(n) = node_by_id(&conn, &id) {
+        if let Some(n) = node_by_id(conn, &id) {
             let star = if n.exported { "★" } else { " " };
             out.push_str(&format!(
-                "{star} {} {}  {}:{}\n",
+                "{prefix}{star} {} {}  {}:{}\n",
                 n.kind, n.qualified_name, n.file_path, n.start_line
             ));
         }
@@ -81,10 +150,61 @@ pub fn search(root: &Path, q: &str) -> Result<String> {
     Ok(out)
 }
 
+/// One repo's answer to an explore. The **variant** carries found-vs-missing;
+/// callers must never re-derive that by searching the rendered text, because
+/// `Found` embeds verbatim source that can contain any sentence we might emit.
+pub enum Explored {
+    /// Payload body **without** the trust banner, so a group caller can put its
+    /// own merged banner on top without splitting a string back apart.
+    Found(String),
+    Missing,
+}
+
+/// Fan-out explore: the full payload from every repo that defines the symbol.
+/// Cross-repo call edges do not exist (each index is scoped to its own root),
+/// so this is a union of per-repo answers, explicitly labeled.
+pub fn explore_group(roots: &[std::path::PathBuf], symbol: &str) -> Result<String> {
+    let mut parts = Vec::new();
+    let mut hits = Vec::new();
+    let mut misses = Vec::new();
+    for root in roots {
+        let label = repo_label(root);
+        let (t, _) = trust_or_missing(root);
+        parts.push(t);
+        match explore_one(root, symbol) {
+            Ok(Explored::Found(body)) => hits.push(format!("# repo `{label}`\n\n{body}")),
+            Ok(Explored::Missing) => misses.push(label),
+            Err(e) => misses.push(format!("{label} (error: {e})")),
+        }
+    }
+    let mut body = String::new();
+    if hits.is_empty() {
+        body.push_str(&format!(
+            "no symbol named `{symbol}` in any group repo. try `search {symbol}`.\n"
+        ));
+    } else {
+        body.push_str(&hits.join("\n---\n\n"));
+    }
+    if !misses.is_empty() {
+        body.push_str(&format!("\nnot found in: {}\n", misses.join(", ")));
+    }
+    Ok(trust::render_group(&parts, roots.len(), &body))
+}
+
 pub fn explore(root: &Path, symbol: &str) -> Result<String> {
+    let banner = trust::banner(&trust_of(root)?);
+    match explore_one(root, symbol)? {
+        Explored::Found(body) => Ok(format!("{banner}\n\n{body}")),
+        Explored::Missing => Ok(format!(
+            "{banner}\n\nno symbol named `{symbol}`. try `search {symbol}` for fuzzy matches."
+        )),
+    }
+}
+
+/// The explore payload for one repo, minus the banner. Returns [`Explored::Missing`]
+/// when no node carries that name — the single place found-vs-missing is decided.
+pub fn explore_one(root: &Path, symbol: &str) -> Result<Explored> {
     let conn = db::open(root)?;
-    let t = trust::compute(&conn, root)?;
-    let banner = trust::banner(&t);
 
     let node = conn
         .query_row(
@@ -96,16 +216,11 @@ pub fn explore(root: &Path, symbol: &str) -> Result<String> {
         .ok();
 
     let Some(n) = node else {
-        return Ok(format!(
-            "{banner}\n\nno symbol named `{symbol}`. try `search {symbol}` for fuzzy matches."
-        ));
+        return Ok(Explored::Missing);
     };
 
     let mut out = String::new();
-    // 1. banner
-    out.push_str(&banner);
-    out.push_str("\n\n");
-    // 2. node + snippet
+    // 1. node + snippet
     out.push_str(&format!(
         "## {} `{}`  ({}:{}-{}){}\n",
         n.kind,
@@ -124,7 +239,7 @@ pub fn explore(root: &Path, symbol: &str) -> Result<String> {
         out.push_str("\n```\n");
     }
 
-    // 3. call-path spine
+    // 2. call-path spine
     out.push_str("\n**call-path spine**\n");
     let spine = call_path_spine(&conn, &n.id);
     if spine.is_empty() {
@@ -135,7 +250,7 @@ pub fn explore(root: &Path, symbol: &str) -> Result<String> {
         }
     }
 
-    // 4. members / heritage
+    // 3. members / heritage
     let members = child_symbols(&conn, &n.id);
     if !members.is_empty() {
         out.push_str("\n**members**\n");
@@ -151,7 +266,7 @@ pub fn explore(root: &Path, symbol: &str) -> Result<String> {
         }
     }
 
-    // 5. depth-grouped blast
+    // 4. depth-grouped blast
     out.push_str("\n**callers ← (blast radius)**\n");
     let blast = blast_by_depth(&conn, &n.id, 4);
     if blast.is_empty() {
@@ -175,7 +290,7 @@ pub fn explore(root: &Path, symbol: &str) -> Result<String> {
         out.push_str(&format!("- {c}\n"));
     }
 
-    // 6. routes / processes
+    // 5. routes / processes
     let routes = routes_touching(&conn, &n.id);
     out.push_str("\n**routes / processes**\n");
     if routes.is_empty() {
@@ -186,7 +301,7 @@ pub fn explore(root: &Path, symbol: &str) -> Result<String> {
         }
     }
 
-    Ok(out)
+    Ok(Explored::Found(out))
 }
 
 fn child_symbols(conn: &Connection, id: &str) -> Vec<NodeRow> {

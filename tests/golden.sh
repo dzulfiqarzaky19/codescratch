@@ -114,4 +114,63 @@ echo "$exp4" | grep -q "handles_route" || fail "route edge missing" "$exp4"
 echo "$exp4" | grep -q "/users"        || fail "route path missing" "$exp4"
 pass "express plugin emits route + handles_route"
 
+# 9. multi-repo groups: fan-out ensure/status/search/explore (WP-10B)
+# HOME is redirected so the real ~/.codescratch/groups.json is never touched.
+export HOME="$tmp/home"
+export USERPROFILE="$HOME"
+mkdir -p "$HOME"
+second="$tmp-second"
+mkdir -p "$second/src"
+cat > "$second/src/other.ts" <<'EOF'
+export function helper(x: number): number { return x + 2; }
+export function otherCaller(n: number): number { return helper(n); }
+EOF
+trap 'rm -rf "$tmp" "$second"' EXIT
+
+"$BIN" group add --group golden --root "$tmp"    >/dev/null
+"$BIN" group add --group golden --root "$second" >/dev/null
+
+gout="$("$BIN" ensure --group golden)"
+echo "$gout" | grep -q "\[group: 2 repos\]" || fail "group banner missing repo count" "$gout"
+pass "ensure --group indexes every member repo"
+
+gsearch="$("$BIN" search helper --group golden)"
+echo "$gsearch" | grep -q "$(basename "$second")\]" || fail "second repo missing from group search" "$gsearch"
+pass "search --group labels hits per repo"
+
+gexp="$("$BIN" explore helper --group golden)"
+echo "$gexp" | grep -q "otherCaller" || fail "second repo blast missing from group explore" "$gexp"
+echo "$gexp" | grep -q 'repo `'      || fail "group explore not labeled per repo" "$gexp"
+pass "explore --group unions per-repo payloads"
+
+# single-root behaviour must stay as it was before groups existed
+single="$("$BIN" status "$tmp")"
+if echo "$single" | grep -q "\[group:"; then fail "single-root status leaked group banner" "$single"; fi
+pass "single-root output unchanged"
+
+# 10. REGRESSION: a repo whose own source contains the "no symbol named" miss
+# sentence must still count as a hit. Group explore decides found-vs-missing
+# from a variant, never by grepping its own rendered payload.
+cat > "$second/src/decoy.ts" <<'EOF'
+export function decoyed(): string {
+  // no symbol named `decoyed`. try `search decoyed` for fuzzy matches.
+  return "x";
+}
+EOF
+"$BIN" ensure --group golden >/dev/null
+dec="$("$BIN" explore decoyed --group golden)"
+echo "$dec" | grep -q "repo \`$(basename "$second")\`" || fail "decoy source text swallowed a real hit" "$dec"
+if echo "$dec" | grep -q "not found in: $(basename "$second")"; then
+  fail "repo defining the symbol reported as a miss" "$dec"
+fi
+pass "source text cannot forge a miss"
+
+# 11. changes is group-aware (was silently single-root)
+echo "export function churn(){ return 99; }" >> "$second/src/other.ts"
+chg="$("$BIN" changes --group golden)"
+echo "$chg" | grep -q "\[group: 2 repos\]" || fail "changes --group missing group banner" "$chg"
+pass "changes --group fans out"
+
+"$BIN" group rm-group --group golden >/dev/null
+
 echo "GOLDEN OK"

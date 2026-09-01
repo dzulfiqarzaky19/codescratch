@@ -8,9 +8,6 @@ pub struct ExpressPlugin;
 const METHODS: &[&str] = &["get", "post", "put", "patch", "delete", "options", "head", "all", "use"];
 
 impl RoutePlugin for ExpressPlugin {
-    fn name(&self) -> &str {
-        "express"
-    }
     fn routes(&self, path: &str, src: &str) -> Vec<RouteFact> {
         let mut out = Vec::new();
         for (i, line) in src.lines().enumerate() {

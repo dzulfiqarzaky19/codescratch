@@ -34,49 +34,63 @@ impl Default for Registry {
     }
 }
 
-/// `~/` — resolved via HOME (Linux/mac), falling back to USERPROFILE (Windows).
-fn home() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+/// Where the registry lives. The directory is a parameter rather than
+/// something the implementation reaches out and computes, so tests can point
+/// at a temp dir without mutating the process-global `HOME`.
+#[derive(Clone)]
+pub struct Store {
+    dir: PathBuf,
 }
 
-/// `~/.codescratch/`
-fn dir() -> PathBuf {
-    home().join(".codescratch")
-}
-
-/// `~/.codescratch/groups.json`
-fn registry_path() -> PathBuf {
-    dir().join("groups.json")
-}
-
-/// Load the registry. A missing file is not an error: it's an empty registry.
-pub fn load() -> Result<Registry> {
-    let path = registry_path();
-    if !path.exists() {
-        return Ok(Registry::default());
+impl Store {
+    pub fn new(dir: PathBuf) -> Self {
+        Store { dir }
     }
-    let raw = std::fs::read_to_string(&path)?;
-    let reg: Registry = serde_json::from_str(&raw)
-        .map_err(|e| anyhow!("malformed groups.json at {}: {e}", path.display()))?;
-    Ok(reg)
+
+    /// The real user-global store: `~/.codescratch/`, resolved via HOME
+    /// (Linux/mac) falling back to USERPROFILE (Windows).
+    pub fn user() -> Self {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Store::new(home.join(".codescratch"))
+    }
+
+    /// `<dir>/groups.json`
+    fn path(&self) -> PathBuf {
+        self.dir.join("groups.json")
+    }
+
+    /// Load the registry. A missing file is not an error: it's an empty registry.
+    pub fn load(&self) -> Result<Registry> {
+        let path = self.path();
+        if !path.exists() {
+            return Ok(Registry::default());
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        serde_json::from_str(&raw)
+            .map_err(|e| anyhow!("malformed groups.json at {}: {e}", path.display()))
+    }
+
+    /// Atomic write: serialize to `groups.json.tmp` then rename over
+    /// `groups.json`, so a crash mid-write never leaves a truncated file.
+    pub fn save(&self, reg: &Registry) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let tmp = self.dir.join("groups.json.tmp");
+        let pretty = serde_json::to_string_pretty(reg)?;
+        std::fs::write(&tmp, pretty)?;
+        std::fs::rename(&tmp, self.path())?;
+        Ok(())
+    }
+}
+
+/// Load from the real user-global store.
+pub fn load() -> Result<Registry> {
+    Store::user().load()
 }
 
 impl Registry {
-    /// Atomic write: serialize to `groups.json.tmp` then rename over
-    /// `groups.json`, so a crash mid-write never leaves a truncated file.
-    pub fn save(&self) -> Result<()> {
-        let dir = dir();
-        std::fs::create_dir_all(&dir)?;
-        let path = registry_path();
-        let tmp = dir.join("groups.json.tmp");
-        let pretty = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp, pretty)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    }
 
     /// All groups, sorted by name, with their member roots.
     pub fn list(&self) -> Vec<(String, Vec<PathBuf>)> {
@@ -130,13 +144,44 @@ impl Registry {
     }
 }
 
+/// Resolve the active scope: `Some(group)` → its member roots (error if the
+/// group is unknown), `None` → the single `root`. One place so every command
+/// gets the same semantics.
+pub fn scope(group: Option<&str>, root: &Path) -> Result<Vec<PathBuf>> {
+    match group {
+        Some(g) => {
+            let roots = load()?.roots(g)?;
+            if roots.is_empty() {
+                return Err(anyhow!("group '{g}' has no roots (add one: codescratch group add --group {g} --root <path>)"));
+            }
+            Ok(roots)
+        }
+        None => Ok(vec![root.to_path_buf()]),
+    }
+}
+
+/// Group name from `--group` or the `CODESCRATCH_GROUP` env var, so a host or
+/// MCP client can pin a group once instead of on every call.
+pub fn from_env(explicit: Option<&str>) -> Option<String> {
+    explicit
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("CODESCRATCH_GROUP").ok())
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// CLI entrypoint: string-dispatch over `action` so main.rs doesn't need to
 /// know about this module's types. Returns human-readable output for the
 /// caller to println!.
 pub fn run(action: &str, group: Option<&str>, root: Option<&Path>) -> Result<String> {
+    run_in(&Store::user(), action, group, root)
+}
+
+/// `run` against an explicit store. Tests drive this with a temp dir instead of
+/// rewriting the process-global `HOME`.
+pub fn run_in(store: &Store, action: &str, group: Option<&str>, root: Option<&Path>) -> Result<String> {
     match action {
         "list" => {
-            let reg = load()?;
+            let reg = store.load()?;
             let groups = reg.list();
             if groups.is_empty() {
                 return Ok("no groups defined".to_string());
@@ -153,30 +198,30 @@ pub fn run(action: &str, group: Option<&str>, root: Option<&Path>) -> Result<Str
         "add" => {
             let group = group.ok_or_else(|| anyhow!("add requires --group"))?;
             let root = root.ok_or_else(|| anyhow!("add requires --root"))?;
-            let mut reg = load()?;
+            let mut reg = store.load()?;
             reg.add(group, root)?;
-            reg.save()?;
+            store.save(&reg)?;
             let n = reg.roots(group)?.len();
             Ok(format!("added {} to '{group}' ({n} root{} total)", root.display(), if n == 1 { "" } else { "s" }))
         }
         "remove" => {
             let group = group.ok_or_else(|| anyhow!("remove requires --group"))?;
             let root = root.ok_or_else(|| anyhow!("remove requires --root"))?;
-            let mut reg = load()?;
+            let mut reg = store.load()?;
             reg.remove_root(group, root)?;
-            reg.save()?;
+            store.save(&reg)?;
             Ok(format!("removed {} from '{group}'", root.display()))
         }
         "rm-group" => {
             let group = group.ok_or_else(|| anyhow!("rm-group requires --group"))?;
-            let mut reg = load()?;
+            let mut reg = store.load()?;
             reg.remove_group(group)?;
-            reg.save()?;
+            store.save(&reg)?;
             Ok(format!("removed group '{group}'"))
         }
         "roots" => {
             let group = group.ok_or_else(|| anyhow!("roots requires --group"))?;
-            let reg = load()?;
+            let reg = store.load()?;
             let roots = reg.roots(group)?;
             if roots.is_empty() {
                 return Ok(format!("'{group}' has no roots"));
@@ -196,17 +241,14 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// Redirect HOME to an isolated tempdir so tests never touch the real
-    /// `~/.codescratch`. env is process-global, so all tests share one HOME
-    /// (set once, first test to run) and use their own group names / temp
-    /// root dirs to avoid interfering with each other.
-    fn test_home() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("cs-group-test-{}", std::process::id()));
+    /// A store in its own temp dir. No env mutation, so tests are independent
+    /// and safe under the default parallel test runner.
+    fn test_store(name: &str) -> Store {
+        let dir = std::env::temp_dir()
+            .join(format!("cs-group-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("HOME", &dir);
-        // Also cover the Windows fallback path in case HOME is unset there.
-        std::env::set_var("USERPROFILE", &dir);
-        dir
+        Store::new(dir)
     }
 
     /// A real temp directory to use as a group root (canonicalize needs it
@@ -220,14 +262,14 @@ mod tests {
 
     #[test]
     fn add_creates_group_and_persists_then_load_sees_it() {
-        test_home();
+        let store = test_store("persist");
         let root = temp_root("persist");
 
-        let mut reg = load().unwrap();
+        let mut reg = store.load().unwrap();
         reg.add("backend", &root).unwrap();
-        reg.save().unwrap();
+        store.save(&reg).unwrap();
 
-        let reloaded = load().unwrap();
+        let reloaded = store.load().unwrap();
         let roots = reloaded.roots("backend").unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0], fs::canonicalize(&root).unwrap());
@@ -236,8 +278,13 @@ mod tests {
     }
 
     #[test]
+    fn missing_registry_file_loads_as_empty() {
+        let store = test_store("missing");
+        assert!(store.load().unwrap().groups.is_empty());
+    }
+
+    #[test]
     fn add_dedupes_roots() {
-        test_home();
         let root = temp_root("dedupe");
 
         let mut reg = Registry::default();
@@ -250,14 +297,12 @@ mod tests {
 
     #[test]
     fn roots_errors_on_unknown_group() {
-        test_home();
         let reg = Registry::default();
         assert!(reg.roots("nope").is_err());
     }
 
     #[test]
     fn add_errors_on_nonexistent_path() {
-        test_home();
         let mut reg = Registry::default();
         let bogus = std::env::temp_dir().join("cs-group-test-does-not-exist-xyz");
         let _ = fs::remove_dir_all(&bogus);
@@ -266,7 +311,6 @@ mod tests {
 
     #[test]
     fn remove_root_and_remove_group_work() {
-        test_home();
         let a = temp_root("rm-a");
         let b = temp_root("rm-b");
 
@@ -289,16 +333,16 @@ mod tests {
 
     #[test]
     fn save_then_load_round_trips_json() {
-        test_home();
+        let store = test_store("roundtrip");
         let a = temp_root("roundtrip-a");
         let b = temp_root("roundtrip-b");
 
         let mut reg = Registry::default();
         reg.add("one", &a).unwrap();
         reg.add("two", &b).unwrap();
-        reg.save().unwrap();
+        store.save(&reg).unwrap();
 
-        let reloaded = load().unwrap();
+        let reloaded = store.load().unwrap();
         assert_eq!(reloaded.version, 1);
         assert_eq!(reloaded.groups.len(), 2);
         let listed = reloaded.list();
@@ -312,26 +356,26 @@ mod tests {
 
     #[test]
     fn run_string_dispatch_covers_all_actions() {
-        test_home();
+        let store = test_store("dispatch");
         let root = temp_root("dispatch");
 
-        let msg = run("list", None, None).unwrap();
-        assert!(msg.contains("no groups") || !msg.is_empty());
+        let msg = run_in(&store, "list", None, None).unwrap();
+        assert!(msg.contains("no groups"));
 
-        let msg = run("add", Some("cli-group"), Some(root.as_path())).unwrap();
+        let msg = run_in(&store, "add", Some("cli-group"), Some(root.as_path())).unwrap();
         assert!(msg.contains("cli-group"));
 
-        let msg = run("roots", Some("cli-group"), None).unwrap();
+        let msg = run_in(&store, "roots", Some("cli-group"), None).unwrap();
         assert!(!msg.is_empty());
 
-        let msg = run("remove", Some("cli-group"), Some(root.as_path())).unwrap();
+        let msg = run_in(&store, "remove", Some("cli-group"), Some(root.as_path())).unwrap();
         assert!(msg.contains("cli-group"));
 
-        let msg = run("rm-group", Some("cli-group"), None);
+        let msg = run_in(&store, "rm-group", Some("cli-group"), None);
         // group still exists (now empty) until explicitly removed
         assert!(msg.is_ok());
 
-        assert!(run("bogus-action", None, None).is_err());
+        assert!(run_in(&store, "bogus-action", None, None).is_err());
 
         let _ = fs::remove_dir_all(&root);
     }

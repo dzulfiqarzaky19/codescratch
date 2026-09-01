@@ -41,11 +41,24 @@ struct FileHunks {
 /// Run the requested `git diff` and render markdown: banner → changed → affected.
 pub fn detect(root: &Path, spec: ChangeSpec) -> Result<String> {
     let conn = db::open(root)?;
-    let t = trust::compute(&conn, root)?;
-    let banner = trust::banner(&t);
+    let banner = trust::banner(&trust::compute(&conn, root)?);
+    // A clean tree still gets the full "nothing changed" body in single-repo
+    // form, so the output is unchanged from before groups existed.
+    let body = detect_one(root, &spec)?.unwrap_or_else(empty_body);
+    Ok(format!("{banner}\n\n{body}"))
+}
 
-    let diff_text = run_git_diff(root, &spec)?;
+/// The changed+affected body for one repo, minus the banner, or `None` when
+/// the diff touches nothing. Group callers use `None` to skip a repo entirely
+/// instead of printing an empty section per member.
+pub fn detect_one(root: &Path, spec: &ChangeSpec) -> Result<Option<String>> {
+    let conn = db::open(root)?;
+
+    let diff_text = run_git_diff(root, spec)?;
     let hunks = parse_hunks(&diff_text);
+    if hunks.is_empty() {
+        return Ok(None);
+    }
 
     // Pull every node once; overlap is a pure in-memory scan (files are small
     // in practice — a handful per diff — so no need to index by file first).
@@ -79,12 +92,9 @@ pub fn detect(root: &Path, spec: ChangeSpec) -> Result<String> {
     let affected = affected_blast(&conn, &changed_ids, MAX_DEPTH)?;
 
     let mut out = String::new();
-    out.push_str(&banner);
-    out.push_str("\n\n");
-
     out.push_str("## changed\n");
     if changed_rows.is_empty() {
-        out.push_str("- (no symbols overlap the diff)\n");
+        out.push_str(NO_OVERLAP);
     } else {
         for n in &changed_rows {
             out.push_str(&format!(
@@ -96,7 +106,7 @@ pub fn detect(root: &Path, spec: ChangeSpec) -> Result<String> {
 
     out.push_str("\n## affected (blast)\n");
     if affected.is_empty() {
-        out.push_str("- (none — no resolved callers, or absence ≠ proof)\n");
+        out.push_str(NO_AFFECTED);
     } else {
         for (depth, n) in &affected {
             out.push_str(&format!(
@@ -113,7 +123,16 @@ pub fn detect(root: &Path, spec: ChangeSpec) -> Result<String> {
         );
     }
 
-    Ok(out)
+    Ok(Some(out))
+}
+
+const NO_OVERLAP: &str = "- (no symbols overlap the diff)\n";
+const NO_AFFECTED: &str = "- (none — no resolved callers, or absence ≠ proof)\n";
+
+/// The body for a repo with an empty diff. Kept identical to what the old
+/// single-repo path printed when no hunk matched a symbol.
+fn empty_body() -> String {
+    format!("## changed\n{NO_OVERLAP}\n## affected (blast)\n{NO_AFFECTED}")
 }
 
 /// Shell out to git for the requested diff, unified with zero context so hunk

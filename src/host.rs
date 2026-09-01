@@ -92,6 +92,24 @@ pub fn reindex(root: &Path) -> Result<()> {
     run_under_lock(root, true)
 }
 
+/// Ensure every root in a group, sequentially (each root has its own lock and
+/// its own `.codescratch/`). One failing repo does not abort the rest; all
+/// failures are collected and reported together.
+pub fn ensure_many(roots: &[std::path::PathBuf], force: bool) -> Result<()> {
+    let mut failures = Vec::new();
+    for root in roots {
+        let r = if force { reindex(root) } else { ensure(root) };
+        if let Err(e) = r {
+            failures.push(format!("{}: {e}", root.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{} repo(s) failed: {}", failures.len(), failures.join("; ")))
+    }
+}
+
 fn run_under_lock(root: &Path, force: bool) -> Result<()> {
     let _lock = Lock::acquire(root)?;
     let mut conn = db::open(root)?;

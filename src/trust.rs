@@ -68,3 +68,133 @@ pub fn banner(t: &Trust) -> String {
         t.trust, t.coverage, t.graph, t.files, t.nodes, t.edges
     )
 }
+
+/// Worst-wins rank for the freshness axis. A group is only as trustworthy as
+/// its least trustworthy member.
+fn trust_rank(s: &str) -> u8 {
+    match s {
+        "fresh" => 0,
+        "stale" => 1,
+        "rebuilding" => 2,
+        _ => 3, // missing / unknown
+    }
+}
+
+/// Trust for a member whose index could not be read. Counts stay zero so the
+/// merge still sums; the freshness axis is `missing`, which ranks worst.
+pub fn missing() -> Trust {
+    Trust {
+        trust: "missing".into(),
+        coverage: "exhaustive".into(),
+        graph: "ok".into(),
+        files: 0,
+        nodes: 0,
+        edges: 0,
+    }
+}
+
+/// Fold per-repo trust into one group-level trust. Counts sum; each axis takes
+/// the worst member value, so a group banner never over-promises.
+/// Callers must include [`missing`] for unreadables — omitting them would let
+/// a dead member hide behind the remaining `fresh` repos.
+pub fn merge(parts: &[Trust]) -> Trust {
+    if parts.is_empty() {
+        return missing();
+    }
+    let worst = parts
+        .iter()
+        .max_by_key(|t| trust_rank(&t.trust))
+        .map(|t| t.trust.clone())
+        .unwrap_or_else(|| "missing".into());
+    let coverage = if parts.iter().any(|t| t.coverage != "exhaustive") {
+        "sampled".to_string()
+    } else {
+        "exhaustive".to_string()
+    };
+    let graph = if parts.iter().any(|t| t.graph != "ok") {
+        "degraded".to_string()
+    } else {
+        "ok".to_string()
+    };
+    Trust {
+        trust: worst,
+        coverage,
+        graph,
+        files: parts.iter().map(|t| t.files).sum(),
+        nodes: parts.iter().map(|t| t.nodes).sum(),
+        edges: parts.iter().map(|t| t.edges).sum(),
+    }
+}
+
+/// Group banner: the normal signature line plus the repo count, so the agent
+/// can see it is reading a fan-out and not one repo.
+pub fn banner_group(t: &Trust, repos: usize) -> String {
+    format!("{}  [group: {} repos]", banner(t), repos)
+}
+
+/// One group payload: merged banner, then the per-repo body. Shared by status,
+/// search, explore, and changes so the merge rule is not re-typed at each call.
+pub fn render_group(parts: &[Trust], repos: usize, body: &str) -> String {
+    let head = banner_group(&merge(parts), repos);
+    if body.is_empty() {
+        head
+    } else {
+        format!("{head}\n\n{}", body.trim_end())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(trust: &str, coverage: &str, graph: &str) -> Trust {
+        Trust {
+            trust: trust.into(),
+            coverage: coverage.into(),
+            graph: graph.into(),
+            files: 1,
+            nodes: 2,
+            edges: 3,
+        }
+    }
+
+    #[test]
+    fn merge_takes_worst_axis_and_sums_counts() {
+        let m = merge(&[t("fresh", "exhaustive", "ok"), t("stale", "sampled", "degraded")]);
+        assert_eq!(m.trust, "stale");
+        assert_eq!(m.coverage, "sampled");
+        assert_eq!(m.graph, "degraded");
+        assert_eq!((m.files, m.nodes, m.edges), (2, 4, 6));
+    }
+
+    #[test]
+    fn merge_ranks_missing_worst_and_empty_is_missing() {
+        let m = merge(&[t("rebuilding", "exhaustive", "ok"), t("missing", "exhaustive", "ok")]);
+        assert_eq!(m.trust, "missing");
+        assert_eq!(merge(&[]).trust, "missing");
+    }
+
+    #[test]
+    fn group_banner_shows_repo_count() {
+        let b = banner_group(&t("fresh", "exhaustive", "ok"), 3);
+        assert!(b.contains("[group: 3 repos]"), "{b}");
+    }
+
+    #[test]
+    fn omitting_an_unreadable_member_would_hide_it_so_missing_must_be_merged() {
+        // Two fresh repos look fresh. Adding the unread member as `missing`
+        // is what makes the group banner honest.
+        let fresh = [t("fresh", "exhaustive", "ok"), t("fresh", "exhaustive", "ok")];
+        assert_eq!(merge(&fresh).trust, "fresh");
+        let with_dead = [t("fresh", "exhaustive", "ok"), missing()];
+        assert_eq!(merge(&with_dead).trust, "missing");
+    }
+
+    #[test]
+    fn render_group_puts_banner_then_body() {
+        let out = render_group(&[t("fresh", "exhaustive", "ok")], 2, "- a\n- b\n");
+        assert!(out.starts_with("trust: fresh"), "{out}");
+        assert!(out.contains("[group: 2 repos]"), "{out}");
+        assert!(out.contains("- a\n- b"), "{out}");
+    }
+}

@@ -3,13 +3,15 @@
 //! Narrow tools stay callable but hidden unless `CODESCRATCH_MCP_TOOLS` lists them.
 //! Hand-rolled (no SDK dep) — only a handful of methods, keeps the binary lean.
 
-use crate::query;
+use crate::scope::Scope;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
-use std::path::Path;
 
-pub fn serve(root: &Path) -> Result<()> {
+/// The served scope: one repo normally, several when the server was started
+/// with `--group`. `Scope` owns the one-vs-many rule; this module just maps
+/// tool names onto it.
+pub fn serve(scope: &Scope) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -30,7 +32,7 @@ pub fn serve(root: &Path) -> Result<()> {
         let reply = match method {
             "initialize" => ok(id, initialize()),
             "tools/list" => ok(id, json!({ "tools": tool_specs() })),
-            "tools/call" => match call_tool(root, &msg) {
+            "tools/call" => match call_tool(scope, &msg) {
                 Ok(text) => ok(id, tool_result(&text, false)),
                 Err(e) => ok(id, tool_result(&format!("error: {e}"), true)),
             },
@@ -99,20 +101,15 @@ fn tool_specs() -> Vec<Value> {
         .collect()
 }
 
-fn call_tool(root: &Path, msg: &Value) -> Result<String> {
+fn call_tool(scope: &Scope, msg: &Value) -> Result<String> {
     let params = msg.get("params").cloned().unwrap_or(json!({}));
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let arg = |k: &str| args.get(k).and_then(|s| s.as_str()).unwrap_or("").to_string();
     match name {
-        "status" => query::status(root),
-        "explore" => {
-            let sym = args.get("symbol").and_then(|s| s.as_str()).unwrap_or("");
-            query::explore(root, sym)
-        }
-        "search" => {
-            let q = args.get("query").and_then(|s| s.as_str()).unwrap_or("");
-            query::search(root, q)
-        }
+        "status" => scope.status(),
+        "explore" => scope.explore(&arg("symbol")),
+        "search" => scope.search(&arg("query")),
         other => Ok(format!("unknown tool `{other}`")),
     }
 }

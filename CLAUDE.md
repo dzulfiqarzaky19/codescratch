@@ -37,6 +37,32 @@ Graph currency is **host** work (`codescratch ensure` + Claude Code hooks), not 
 
 Optional `root` on every tool for monorepos (else `CODESCRATCH_ROOT` / cwd).
 
+### Multi-repo groups
+
+A group is a named set of repo roots (`~/.codescratch/groups.json`). Each repo keeps its own `.codescratch/` index and its own lock; a group is a **fan-out at query time**, not a merged index.
+
+```
+codescratch group add --group pay --root ~/src/api
+codescratch group add --group pay --root ~/src/web
+codescratch ensure  --group pay      # indexes each member, sequential
+codescratch status  --group pay      # merged banner + one line per repo
+codescratch search  helper --group pay
+codescratch explore chargeCard --group pay
+codescratch setup   --group pay      # MCP server serves the group
+codescratch mcp . --group pay
+```
+
+`--group` on any command, or `CODESCRATCH_GROUP=pay` to pin it.
+
+`--group` works on `ensure`, `reindex`, `status`, `search`, `explore`, `changes`, `watch`, `mcp`, `setup`.
+
+- Group banner = worst-wins per axis + summed counts, suffixed `[group: N repos]`. One `stale` member makes the group `stale`.
+- `search --group` prefixes hits `[repo]`. Ranking is per-repo; scores across separate indexes are not comparable.
+- `explore --group` returns a union of per-repo payloads under `# repo \`name\``, plus `not found in: …`.
+- **No cross-repo edges.** Each index resolves inside its own root, so an `api → web` call is invisible. Same-named symbols in two repos are two answers, not one.
+- A dead/unreadable member is reported inline (`unavailable`) and never hides the rest.
+- Single-root output is unchanged: the group form only kicks in with >1 root.
+
 ### Trust / confidence
 
 - `strong` — a binding or lexical fact. **Never a type check.**
@@ -81,6 +107,7 @@ src/
   extract/     tree-sitter TS/JS/Python + import bindings (plugins/ for route frameworks)
   index.rs     walk, hash, scoped resolve, incremental dirty-gate
   host.rs      ensure/reindex lock + git HEAD (host freshness)
+  scope.rs     Scope: the roots a command acts on; owns the one-vs-many rule
   query.rs     explore/search/status + trust; hybrid search via embeddings.rs
   analysis.rs  communities (label propagation) + processes (call chains)
   embeddings.rs  local feature-hash embeddings + RRF hybrid search
