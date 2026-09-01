@@ -125,26 +125,13 @@ fn empty_body() -> String {
     format!("## changed\n{NO_OVERLAP}\n## affected (blast)\n{NO_AFFECTED}")
 }
 
-/// Shell out to git for the requested diff, unified with zero context so hunk
-/// ranges are tight. Mirrors `host::git_head`'s `Command::new("git")` style.
 fn run_git_diff(root: &Path, spec: &ChangeSpec) -> Result<String> {
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(root).arg("diff").arg("--unified=0");
-    match spec {
-        ChangeSpec::Unstaged => {}
-        ChangeSpec::Staged => {
-            cmd.arg("--cached");
-        }
-        ChangeSpec::Compare(reference) => {
-            cmd.arg(reference);
-        }
-    }
-    let out = cmd.output()?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("git diff failed: {}", stderr.trim());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let extra: Vec<&str> = match spec {
+        ChangeSpec::Unstaged => vec![],
+        ChangeSpec::Staged => vec!["--cached"],
+        ChangeSpec::Compare(reference) => vec![reference.as_str()],
+    };
+    crate::git::diff(root, &extra)
 }
 
 fn load_nodes(conn: &rusqlite::Connection) -> Result<Vec<NodeRow>> {

@@ -2,7 +2,7 @@
 //! per-file dirty ∪ importers is not this module (RUST-REWRITE.md).
 
 use crate::model::{Edge, FileFacts, RouteFact, Symbol};
-use crate::{extract, resolve, walk};
+use crate::{extract, module, resolve, walk};
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
@@ -35,7 +35,7 @@ pub fn index_all(conn: &mut Connection, root: &Path) -> Result<()> {
         bindings.extend(s.facts.imports.iter().cloned());
     }
 
-    let cfg = resolve::load_config(root, &files_set);
+    let cfg = module::load_config(root, &files_set);
     let mut heritage: Vec<Edge> = Vec::new();
     let mut extra: Vec<Edge> = Vec::new();
     let mut routes: Vec<RouteFact> = Vec::new();

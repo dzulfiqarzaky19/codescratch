@@ -10,23 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOCK_TTL_MS: u128 = 120_000; // steal a lock older than this (crashed writer)
 
-/// Current git HEAD, or None on a non-git tree. Shells out to avoid libgit2.
+/// Current git HEAD, or None on a non-git tree.
 pub fn git_head(root: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    crate::git::head(root)
 }
 
 fn now_ms() -> u128 {
