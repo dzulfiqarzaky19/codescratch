@@ -175,13 +175,23 @@ pub fn index_all(conn: &mut Connection, root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether [`ensure_current`] wrote a new graph. Host materializes communities
+/// and embeddings only on [`IndexOutcome::Wrote`] — a skipped ensure must not
+/// walk 49k edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexOutcome {
+    Wrote,
+    Skipped,
+}
+
 /// Dirty-gate then full rebuild. Not a scoped incremental: a partial rewrite
 /// would desync edges. No-op when `mtime`+`size` match.
-pub fn ensure_current(conn: &mut Connection, root: &Path) -> Result<()> {
+pub fn ensure_current(conn: &mut Connection, root: &Path) -> Result<IndexOutcome> {
     if !is_dirty(conn, root)? {
-        return Ok(());
+        return Ok(IndexOutcome::Skipped);
     }
-    index_all(conn, root)
+    index_all(conn, root)?;
+    Ok(IndexOutcome::Wrote)
 }
 
 /// True if any tracked source file was added, removed, or changed since the last

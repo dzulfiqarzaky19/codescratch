@@ -76,9 +76,10 @@ impl Scope {
         let mut misses = Vec::new();
         let (parts, _) = self.fold_group(|root, label, _t, _err| {
             match query::explore_one(root, symbol) {
-                Ok(Explored::Found(view)) => {
-                    hits.push(format!("# repo `{label}`\n\n{}", query::render_view(&view)))
-                }
+                Ok(Explored::Found(view)) => hits.push(format!(
+                    "# repo `{label}`\n\n{}",
+                    crate::explore::render_view(&view)
+                )),
                 Ok(Explored::Missing { .. }) => misses.push(label.to_string()),
                 Err(e) => misses.push(format!("{label} (error: {e})")),
             }

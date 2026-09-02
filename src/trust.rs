@@ -2,7 +2,7 @@
 //! every explore/status payload. Ported from codescratch `src/query/trust.ts`
 //! + `format.ts`. Neither parent tool has this.
 
-use crate::{db, host};
+use crate::{db, git};
 use anyhow::Result;
 use rusqlite::Connection;
 use std::path::Path;
@@ -29,7 +29,7 @@ pub fn compute(conn: &Connection, root: &Path) -> Result<Trust> {
         "rebuilding"
     } else {
         let indexed = db::get_meta(conn, "indexed_head")?;
-        match (indexed, host::git_head(root)) {
+        match (indexed, git::head(root)) {
             // git repo, and HEAD moved since index → stale
             (Some(a), Some(b)) if a != b => "stale",
             (Some(_), Some(_)) => "fresh",

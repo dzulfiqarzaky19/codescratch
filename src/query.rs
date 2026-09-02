@@ -137,7 +137,3 @@ pub fn explore_one(root: &Path, symbol: &str) -> Result<Explored> {
 
     Ok(Explored::Found(explore_mod::gather(&conn, root, n)))
 }
-
-pub(crate) fn render_view(v: &explore_mod::ExploreView) -> String {
-    explore_mod::render_view(v)
-}

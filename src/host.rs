@@ -1,7 +1,7 @@
 //! Host-owned freshness. `ensure` runs under a single-flight lock so readers
 //! never see a half-written graph. Ported from codescratch `src/host/`.
 
-use crate::{analysis, db, embeddings, index};
+use crate::{analysis, db, embeddings, git, index};
 use anyhow::{anyhow, Result};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -9,11 +9,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOCK_TTL_MS: u128 = 120_000; // steal a lock older than this (crashed writer)
-
-/// Current git HEAD, or None on a non-git tree.
-pub fn git_head(root: &Path) -> Option<String> {
-    crate::git::head(root)
-}
 
 fn now_ms() -> u128 {
     SystemTime::now()
@@ -114,23 +109,32 @@ fn run_under_lock(root: &Path, force: bool) -> Result<()> {
 
     db::set_meta(&conn, "reindex_state", "rebuilding")?;
 
-    let result = if force {
-        index::index_all(&mut conn, root)
-    } else {
-        index::ensure_current(&mut conn, root)
-    };
+    let result = (|| -> Result<bool> {
+        if force {
+            index::index_all(&mut conn, root)?;
+            Ok(true)
+        } else {
+            Ok(matches!(
+                index::ensure_current(&mut conn, root)?,
+                index::IndexOutcome::Wrote
+            ))
+        }
+    })();
 
-    // Always clear the rebuilding flag, even on failure.
+    // Always clear the rebuilding flag, even on failure or skip.
     db::set_meta(&conn, "reindex_state", "idle")?;
-    result?;
+    let wrote = result?;
 
-    // Heuristic aggregations over the freshly-written graph. Both are idempotent
-    // and cheap; a full reindex wipes `nodes`, so these are the only thing that
-    // repopulates community/process nodes + embeddings afterward.
-    analysis::materialize(&mut conn)?;
-    embeddings::materialize(&mut conn)?;
+    // Heuristic aggregations only after a real write. A skipped dirty-gate must
+    // not walk the calls graph or rebuild embeddings.
+    if wrote {
+        analysis::materialize(&mut conn)?;
+        embeddings::materialize(&mut conn)?;
+    }
 
-    match git_head(root) {
+    // HEAD is cheap and must stay current even on skip (a README-only commit
+    // would otherwise leave trust:stale forever).
+    match git::head(root) {
         Some(h) => db::set_meta(&conn, "indexed_head", &h)?,
         None => {
             let _ = conn.execute("DELETE FROM meta WHERE key = 'indexed_head'", []);
