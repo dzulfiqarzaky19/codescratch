@@ -169,4 +169,14 @@ pass "changes --group fans out"
 
 "$BIN" group rm-group --group golden >/dev/null
 
+# 12. README-only / empty commit must not leave trust:stale after ensure.
+# Host writes indexed_head even when the dirty-gate skips.
+git -C "$tmp" -c user.email=t@t -c user.name=t commit --allow-empty -qm empty
+stale="$("$BIN" status "$tmp")"
+echo "$stale" | grep -q "trust: stale" || fail "empty commit should stale before ensure" "$stale"
+"$BIN" ensure "$tmp" >/dev/null
+fresh="$("$BIN" status "$tmp")"
+echo "$fresh" | grep -q "trust: fresh" || fail "ensure did not clear HEAD-drift stale" "$fresh"
+pass "ensure clears trust:stale after empty commit"
+
 echo "GOLDEN OK"

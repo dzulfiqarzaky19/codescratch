@@ -15,6 +15,12 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** Convention markers — grep these, do not `explore`. */
+const NOT_SYMBOL = new Set(["TODO", "FIXME", "HACK", "XXX"]);
+
+function isSymbolIdent(q: string): boolean {
+	return IDENT.test(q) && !NOT_SYMBOL.has(q);
+}
 
 function bin(): string | null {
 	const fromEnv = process.env.CODESCRATCH_BIN;
@@ -36,7 +42,7 @@ function kick(args: string[], cwd: string): ChildProcess | null {
 	return child;
 }
 
-function identifierFromRg(command: string): string | null {
+export function identifierFromRg(command: string): string | null {
 	// rg/grep/ag of a single argv token that looks like a symbol, no -e/-i/-P/-F flags
 	// that imply string/regex search. Path args after `--` are fine.
 	const trimmed = command.trim();
@@ -48,7 +54,7 @@ function identifierFromRg(command: string): string | null {
 	const positional = tokens.filter((t) => !t.startsWith("-"));
 	if (positional.length !== 1) return null;
 	const q = positional[0].replace(/^['"]|['"]$/g, "");
-	return IDENT.test(q) ? q : null;
+	return isSymbolIdent(q) ? q : null;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -79,7 +85,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.toolName === "grep") {
 			const pattern = String(input.pattern ?? "");
 			if (input.ignoreCase) return;
-			if (!IDENT.test(pattern)) return;
+			if (!isSymbolIdent(pattern)) return;
 			return {
 				block: true,
 				reason: `codescratch: use \`codescratch explore ${pattern}\` (or \`search ${pattern}\`) instead of grep for a symbol. grep is for strings/regex/TODO.`,
