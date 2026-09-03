@@ -89,7 +89,7 @@ impl Store {
 }
 
 /// Load from the real user-global store.
-pub fn load() -> Result<Registry> {
+fn load() -> Result<Registry> {
     Store::user().load()
 }
 

@@ -17,7 +17,7 @@ pub const MAX_DEPTH: usize = 4;
 #[derive(Debug, Clone)]
 pub struct Hop {
     pub depth: usize,
-    pub src_id: String,
+    src_id: String,
     pub node: Option<NodeRow>,
     pub file_path: String,
     pub line: i64,

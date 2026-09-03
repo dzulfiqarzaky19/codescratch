@@ -77,7 +77,7 @@ pub fn ensure(root: &Path) -> Result<()> {
 
 /// Emergency full rebuild: bypass the dirty-gate and re-parse everything, even
 /// when `mtime`+`size` say nothing changed. Same lock as `ensure`.
-pub fn reindex(root: &Path) -> Result<()> {
+fn reindex(root: &Path) -> Result<()> {
     run_under_lock(root, true)
 }
 
