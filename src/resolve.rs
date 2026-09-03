@@ -361,7 +361,7 @@ fn pick_in_file<'a>(
 }
 
 /// Resolve any specifier: relative, alias, baseUrl, workspace package.
-pub fn resolve_module(
+fn resolve_module(
     from_file: &str,
     spec: &str,
     files: &HashSet<String>,

@@ -159,7 +159,7 @@ pub fn merge(parts: &[Trust]) -> Trust {
 
 /// Group banner: the normal signature line plus the repo count, so the agent
 /// can see it is reading a fan-out and not one repo.
-pub fn banner_group(t: &Trust, repos: usize) -> String {
+fn banner_group(t: &Trust, repos: usize) -> String {
     format!("{}  [group: {} repos]", banner(t), repos)
 }
 

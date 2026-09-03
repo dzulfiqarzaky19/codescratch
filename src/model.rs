@@ -184,20 +184,3 @@ pub struct RouteFact {
     pub file_path: String,
     pub line: usize,
 }
-
-/// A precomputed call chain entrypoint→leaf (v0.4 → `process` node + `step_in` edges).
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ProcessFact {
-    pub name: String,
-    pub steps: Vec<String>, // ordered node ids
-}
-
-/// A graph community (v0.4 Leiden → `community` node + `member_of` edges).
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct Community {
-    pub id: String,
-    pub label: String,
-    pub members: Vec<String>, // node ids
-}

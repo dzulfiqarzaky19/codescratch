@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 pub const SCHEMA_VERSION: &str = "2";
 
 /// `<root>/.codescratch/graph.db`
-pub fn db_path(root: &Path) -> PathBuf {
+fn db_path(root: &Path) -> PathBuf {
     root.join(".codescratch").join("graph.db")
 }
 

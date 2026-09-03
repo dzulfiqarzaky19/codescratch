@@ -128,10 +128,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Init { path } => {
-            let root = root_of(path);
-            db::open(&root)?; // create schema
-            host::ensure(&root)?;
-            println!("{}", query::status(&root)?);
+            let scope = scope_of(None, path.clone())?;
+            scope.ensure(false)?;
+            println!("{}", scope.status()?);
+            let root = &scope.roots()[0];
             println!("graph ready at {}/.codescratch/graph.db", root.display());
         }
         Command::Ensure { path, group } => {

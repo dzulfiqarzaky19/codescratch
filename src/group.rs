@@ -175,7 +175,7 @@ fn named_roots(g: &str) -> Result<Vec<PathBuf>> {
 /// - Ambiguous (parent of two groups, or member of none) → single `root`.
 /// Failures to load the registry degrade to single-root, never error: a missing
 /// `groups.json` must not break `codescratch status` in a normal repo.
-pub fn infer(root: &Path) -> Vec<PathBuf> {
+fn infer(root: &Path) -> Vec<PathBuf> {
     let Ok(reg) = load() else {
         return vec![root.to_path_buf()];
     };
