@@ -5,6 +5,7 @@
 use crate::scope::Scope;
 use crate::{host, walk};
 use anyhow::{Context, Result};
+use ignore::gitignore::Gitignore;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,17 @@ fn should_flush(pending_count: usize, elapsed_since_first: Duration) -> bool {
 
 fn relevant(rel: &str) -> bool {
     walk::tracked(rel).is_some()
+}
+
+/// Root `.gitignore` only — matches WalkBuilder's default skip of `node_modules`
+/// (and whatever else the repo ignores) so a `npm i` storm does not enqueue.
+fn gitignore_of(root: &Path) -> Gitignore {
+    let (gi, _) = Gitignore::new(root.join(".gitignore"));
+    gi
+}
+
+fn ignored(gi: &Gitignore, rel: &str) -> bool {
+    gi.matched_path_or_any_parents(rel, false).is_ignore()
 }
 
 /// Convert an absolute event path to a repo-relative, forward-slash path.
@@ -68,6 +80,8 @@ pub fn run(scope: &Scope) -> Result<()> {
     let mut watcher: RecommendedWatcher =
         notify::recommended_watcher(tx).context("failed to create filesystem watcher")?;
 
+    let ignores: Vec<Gitignore> = roots.iter().map(|r| gitignore_of(r)).collect();
+
     for root in roots {
         watcher
             .watch(root, RecursiveMode::Recursive)
@@ -87,6 +101,9 @@ pub fn run(scope: &Scope) -> Result<()> {
                         continue;
                     };
                     let i = roots.iter().position(|r| r == root).unwrap_or(0);
+                    if ignored(&ignores[i], &rel) {
+                        continue;
+                    }
                     if pending[i].insert(rel) && first_pending_at[i].is_none() {
                         first_pending_at[i] = Some(Instant::now());
                     }
@@ -113,7 +130,7 @@ pub fn run(scope: &Scope) -> Result<()> {
             }
             let n = pending[i].len();
             let where_ = if roots.len() > 1 {
-                format!(" in {}", crate::query::repo_label(root))
+                format!(" in {}", crate::trust::repo_label(root))
             } else {
                 String::new()
             };
@@ -203,5 +220,17 @@ mod tests {
         assert!(owning_root(&roots, Path::new("/elsewhere/x.ts")).is_none());
         assert!(owning_root(&roots, Path::new("/a/README.md")).is_none());
         assert!(owning_root(&roots, Path::new("/a/.git/HEAD")).is_none());
+    }
+
+    #[test]
+    fn gitignore_skips_node_modules() {
+        let dir = std::env::temp_dir().join(format!("cs-watch-gi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".gitignore"), "node_modules\n").unwrap();
+        let gi = gitignore_of(&dir);
+        assert!(ignored(&gi, "node_modules/left-pad/index.js"));
+        assert!(!ignored(&gi, "src/main.ts"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

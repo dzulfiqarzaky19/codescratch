@@ -2,7 +2,7 @@
 name = "codescratch"
 version = "0.1.0"
 edition = "2021"
-description = "Local code structure graph for AI agents — TS/JS, SQLite, MCP. Single static binary."
+description = "Local code structure graph for AI agents — TS/JS, SQLite, CLI. Single static binary."
 license = "MIT"
 
 [[bin]]

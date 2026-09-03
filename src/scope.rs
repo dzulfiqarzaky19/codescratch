@@ -3,7 +3,7 @@
 //!
 //! Callers say `scope.explore(sym)` instead of `if roots.len() == 1`. The
 //! one-vs-many *dispatch* lives here; per-repo work stays in `query` / `host`
-//! / `changes`. Group fan-out (trust_or_missing + dead-member merge +
+//! / `changes`. Group fan-out (trust::or_missing + dead-member merge +
 //! `trust::render_group`) is one loop — a group honesty leak is one place to
 //! miss. One root renders exactly what it rendered before groups existed.
 
@@ -22,7 +22,7 @@ impl Scope {
     /// so a typo fails here instead of silently degrading to one repo.
     pub fn resolve(group_name: Option<&str>, root: &Path) -> Result<Self> {
         let name = group::from_env(group_name);
-        let roots = group::scope(name.as_deref(), root)?;
+        let roots = group::roots(name.as_deref(), root)?;
         Ok(Scope { roots })
     }
 
@@ -78,7 +78,7 @@ impl Scope {
             match query::explore_one(root, symbol) {
                 Ok(Explored::Found(view)) => hits.push(format!(
                     "# repo `{label}`\n\n{}",
-                    crate::explore::render_view(&view)
+                    query::render_view(&view)
                 )),
                 Ok(Explored::Missing { .. }) => misses.push(label.to_string()),
                 Err(e) => misses.push(format!("{label} (error: {e})")),
@@ -119,7 +119,7 @@ impl Scope {
         Ok(trust::render_group(&parts, self.roots.len(), &body))
     }
 
-    /// One loop over members: always `trust_or_missing` (so a dead repo cannot
+    /// One loop over members: always `trust::or_missing` (so a dead repo cannot
     /// hide behind the rest), then `body_of` builds that member's fragment.
     /// `None` omits the member from the body; the banner still counts it.
     fn fold_group(
@@ -129,8 +129,8 @@ impl Scope {
         let mut parts = Vec::new();
         let mut body = String::new();
         for root in &self.roots {
-            let label = query::repo_label(root);
-            let (t, err) = query::trust_or_missing(root);
+            let label = trust::repo_label(root);
+            let (t, err) = trust::or_missing(root);
             if let Some(chunk) = body_of(root, &label, &t, err.as_deref())? {
                 body.push_str(&chunk);
             }

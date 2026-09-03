@@ -92,14 +92,16 @@ pub struct ImportBinding {
     pub kind: String,          // named | default | namespace
 }
 
-/// What one file yields when extracted. Heritage is collected in the same
-/// walk as symbols — a second parse is not a second source of truth.
+/// What one file yields when extracted. Heritage, heuristic edges, and routes
+/// are filled in the same `extract()` call — index does not re-walk source.
 #[derive(Default)]
 pub struct FileFacts {
     pub symbols: Vec<Symbol>,
     pub calls: Vec<RawCall>,
     pub imports: Vec<ImportBinding>,
     pub heritage: Vec<Edge>,
+    pub extra: Vec<Edge>,
+    pub routes: Vec<RouteFact>,
 }
 
 /// A resolved (or deliberately unresolved) graph edge.

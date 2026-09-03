@@ -1,7 +1,7 @@
 //! Next.js app-router file-convention routes. `app/**/page.tsx` → GET that path.
 
 use crate::model::RouteFact;
-use crate::plugin::RoutePlugin;
+use super::RoutePlugin;
 
 pub struct NextPlugin;
 

@@ -1,7 +1,7 @@
 //! Express / typical `app.get('/path', handler)` route plugin.
 
 use crate::model::RouteFact;
-use crate::plugin::RoutePlugin;
+use super::RoutePlugin;
 
 pub struct ExpressPlugin;
 

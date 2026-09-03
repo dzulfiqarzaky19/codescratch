@@ -1,8 +1,8 @@
 //! Walk → hash → extract → store. `ensure` dirty-gates then full-rebuilds;
 //! per-file dirty ∪ importers is not this module (RUST-REWRITE.md).
 
-use crate::model::{Edge, FileFacts, RouteFact, Symbol};
-use crate::{extract, module, resolve, walk};
+use crate::model::{FileFacts, Symbol};
+use crate::{extract, resolve, walk};
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
@@ -15,7 +15,6 @@ struct Scanned {
     mtime_ms: i64,
     size: i64,
     language: String,
-    src: String,
     facts: FileFacts,
 }
 
@@ -35,14 +34,14 @@ pub fn index_all(conn: &mut Connection, root: &Path) -> Result<()> {
         bindings.extend(s.facts.imports.iter().cloned());
     }
 
-    let cfg = module::load_config(root, &files_set);
-    let mut heritage: Vec<Edge> = Vec::new();
-    let mut extra: Vec<Edge> = Vec::new();
-    let mut routes: Vec<RouteFact> = Vec::new();
+    let cfg = resolve::load_config(root, &files_set);
+    let mut heritage = Vec::new();
+    let mut extra = Vec::new();
+    let mut routes = Vec::new();
     for s in &scanned {
         heritage.extend(s.facts.heritage.iter().cloned());
-        extra.extend(extract::heuristics::extra_edges(&s.path, &s.src, &s.facts));
-        routes.extend(extract::plugins::collect(&s.path, &s.src));
+        extra.extend(s.facts.extra.iter().cloned());
+        routes.extend(s.facts.routes.iter().cloned());
     }
     let mut edges =
         resolve::resolve_with_heritage(&symbols, &calls, &bindings, &heritage, &files_set, &cfg);
@@ -240,7 +239,6 @@ fn scan(root: &Path) -> Vec<Scanned> {
             mtime_ms: e.mtime_ms,
             size: e.size,
             language: e.lang.as_str().to_string(),
-            src,
             facts,
         });
     }

@@ -5,7 +5,7 @@ use crate::model::{Edge, FileFacts, Provenance};
 
 /// Pattern-guess extra edges from already-extracted facts + raw source.
 /// Does not invent resolved destinations — those stay open for the resolver.
-pub fn extra_edges(path_rel: &str, src: &str, facts: &FileFacts) -> Vec<Edge> {
+pub(super) fn extra_edges(path_rel: &str, src: &str, facts: &FileFacts) -> Vec<Edge> {
     let mut out = Vec::new();
     out.extend(callback_args(path_rel, facts));
     out.extend(event_emitter(path_rel, src, facts));
@@ -167,12 +167,12 @@ export function fire() { bus.emit('ready'); }
 export function go() {}
 "#;
         let f = extract("src/a.ts", src);
-        let edges = extra_edges("src/a.ts", src, &f);
         assert!(
-            edges.iter().any(|e| e.kind == "dispatches"
+            f.extra.iter().any(|e| e.kind == "dispatches"
                 && e.reason == "event-emit-on"
                 && e.provenance == "heuristic"),
-            "expected emit/on dispatch: {edges:?}"
+            "expected emit/on dispatch: {:?}",
+            f.extra
         );
     }
 
@@ -186,12 +186,12 @@ class Box {
 }
 "#;
         let f = extract("src/a.ts", src);
-        let edges = extra_edges("src/a.ts", src, &f);
         assert!(
-            edges
+            f.extra
                 .iter()
                 .any(|e| e.reason == "setState-render" && e.provenance == "heuristic"),
-            "expected setState→render: {edges:?}"
+            "expected setState→render: {:?}",
+            f.extra
         );
     }
 }

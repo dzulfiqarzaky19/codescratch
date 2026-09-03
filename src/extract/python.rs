@@ -3,7 +3,7 @@
 //! API is stable across tree-sitter versions; avoids the version-fragile Query
 //! API on purpose).
 
-use super::walk::{self, push_binding, Ctx};
+use super::ast::{self, push_binding, Ctx};
 use crate::model::{Edge, FileFacts, RawCall, Symbol};
 use tree_sitter::{Node, Parser};
 
@@ -30,7 +30,7 @@ pub fn extract(path: &str, src: &str) -> FileFacts {
 }
 
 fn signature(n: Node, bytes: &[u8]) -> String {
-    let full = walk::text(n, bytes);
+    let full = ast::text(n, bytes);
     let cut = full.find([':', '\n']).unwrap_or(full.len());
     let mut s = full[..cut].trim().to_string();
     if s.len() > 200 {
@@ -51,7 +51,7 @@ fn visit(node: Node, ctx: &mut Ctx) {
                     let qual = ctx
                         .class
                         .as_ref()
-                        .map(|(c, _)| format!("{c}.{}", walk::text(name, ctx.bytes)));
+                        .map(|(c, _)| format!("{c}.{}", ast::text(name, ctx.bytes)));
                     ("method", qual)
                 } else {
                     ("function", None)
@@ -63,19 +63,19 @@ fn visit(node: Node, ctx: &mut Ctx) {
                 // Descend into the body with this def as the new enclosing
                 // symbol; class context is cleared so a def nested inside a
                 // method's body isn't mistaken for another method.
-                walk::recurse_with(node, ctx, Some(id), None, visit);
+                ast::recurse_with(node, ctx, Some(id), None, visit);
                 return;
             }
         }
         "class_definition" => {
             if let Some(name) = node.child_by_field_name("name") {
-                let nm = walk::text(name, ctx.bytes).to_string();
+                let nm = ast::text(name, ctx.bytes).to_string();
                 let exported = ctx.enclosing.is_none() && ctx.class.is_none();
                 let id = push_symbol(ctx, node, name, "class", None, exported);
                 record_heritage(node, ctx, &id);
                 // Descend with this class as context and no enclosing function,
                 // so direct-child defs are recognized as methods.
-                walk::recurse_with(node, ctx, None, Some((nm, id)), visit);
+                ast::recurse_with(node, ctx, None, Some((nm, id)), visit);
                 return;
             }
         }
@@ -108,7 +108,7 @@ fn push_symbol(
     qual: Option<String>,
     exported: bool,
 ) -> String {
-    walk::push_symbol(
+    ast::push_symbol(
         ctx,
         def,
         name,
@@ -124,9 +124,9 @@ fn record_call(node: Node, ctx: &mut Ctx) {
         return;
     };
     let (name, member) = match callee.kind() {
-        "identifier" => (walk::text(callee, ctx.bytes).to_string(), false),
+        "identifier" => (ast::text(callee, ctx.bytes).to_string(), false),
         "attribute" => match callee.child_by_field_name("attribute") {
-            Some(p) => (walk::text(p, ctx.bytes).to_string(), true),
+            Some(p) => (ast::text(p, ctx.bytes).to_string(), true),
             None => return,
         },
         _ => return,
@@ -154,7 +154,7 @@ fn record_import_statement(node: Node, ctx: &mut Ctx) {
     for child in node.children_by_field_name("name", &mut cursor) {
         match child.kind() {
             "dotted_name" => {
-                let module = walk::text(child, ctx.bytes).to_string();
+                let module = ast::text(child, ctx.bytes).to_string();
                 push_binding(ctx, &module, &module, "*", "namespace");
             }
             "aliased_import" => {
@@ -164,8 +164,8 @@ fn record_import_statement(node: Node, ctx: &mut Ctx) {
                 let Some(alias) = child.child_by_field_name("alias") else {
                     continue;
                 };
-                let module = walk::text(name, ctx.bytes).to_string();
-                let local = walk::text(alias, ctx.bytes).to_string();
+                let module = ast::text(name, ctx.bytes).to_string();
+                let local = ast::text(alias, ctx.bytes).to_string();
                 push_binding(ctx, &module, &local, "*", "namespace");
             }
             _ => {}
@@ -179,7 +179,7 @@ fn record_import_from_statement(node: Node, ctx: &mut Ctx) {
     let Some(module_node) = node.child_by_field_name("module_name") else {
         return;
     };
-    let module = walk::text(module_node, ctx.bytes).to_string();
+    let module = ast::text(module_node, ctx.bytes).to_string();
     if module.is_empty() {
         return;
     }
@@ -187,7 +187,7 @@ fn record_import_from_statement(node: Node, ctx: &mut Ctx) {
     for child in node.children_by_field_name("name", &mut cursor) {
         match child.kind() {
             "dotted_name" => {
-                let nm = walk::text(child, ctx.bytes).to_string();
+                let nm = ast::text(child, ctx.bytes).to_string();
                 push_binding(ctx, &module, &nm, &nm, "named");
             }
             "aliased_import" => {
@@ -197,8 +197,8 @@ fn record_import_from_statement(node: Node, ctx: &mut Ctx) {
                 let Some(alias) = child.child_by_field_name("alias") else {
                     continue;
                 };
-                let orig = walk::text(name, ctx.bytes).to_string();
-                let local = walk::text(alias, ctx.bytes).to_string();
+                let orig = ast::text(name, ctx.bytes).to_string();
+                let local = ast::text(alias, ctx.bytes).to_string();
                 push_binding(ctx, &module, &local, &orig, "named");
             }
             _ => {}
@@ -222,7 +222,7 @@ fn record_heritage(node: Node, ctx: &mut Ctx, class_id: &str) {
     let mut cursor = supers.walk();
     for child in supers.children(&mut cursor) {
         let raw = match child.kind() {
-            "identifier" | "attribute" | "dotted_name" => walk::text(child, ctx.bytes),
+            "identifier" | "attribute" | "dotted_name" => ast::text(child, ctx.bytes),
             _ => continue,
         };
         if raw.is_empty() {

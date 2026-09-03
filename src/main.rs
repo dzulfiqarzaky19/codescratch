@@ -6,16 +6,12 @@ mod blast;
 mod changes;
 mod db;
 mod embeddings;
-mod explore;
 mod extract;
 mod git;
 mod group;
 mod host;
 mod index;
-mod mcp;
 mod model;
-mod module;
-mod plugin;
 mod query;
 mod resolve;
 mod scope;
@@ -82,17 +78,10 @@ enum Command {
         #[arg(long)]
         group: Option<String>,
     },
-    /// Serve the MCP stdio server (explore + status listed).
-    Mcp {
-        path: Option<PathBuf>,
-        /// Serve a whole group: every tool fans out over its repos.
-        #[arg(long)]
-        group: Option<String>,
-    },
-    /// Write MCP client config for detected agents (WP-2E).
+    /// Write the global skill + Pi host extension; strip leftover MCP entries.
     Setup {
         path: Option<PathBuf>,
-        /// Configure the server to serve this group instead of one root.
+        /// Validate this group exists (skill itself is global, not pinned).
         #[arg(long)]
         group: Option<String>,
     },
@@ -129,7 +118,8 @@ fn root_of(path: Option<PathBuf>) -> PathBuf {
 }
 
 /// The scope a command acts on: a group's members (`--group` or
-/// `CODESCRATCH_GROUP`), else the single resolved root.
+/// `CODESCRATCH_GROUP`), else cwd if it is the unique parent of one group,
+/// else the single resolved root.
 fn scope_of(group: Option<String>, path: Option<PathBuf>) -> Result<Scope> {
     Scope::resolve(group.as_deref(), &root_of(path))
 }
@@ -171,15 +161,10 @@ fn main() -> Result<()> {
         } => {
             println!("{}", scope_of(group, path)?.search(&q)?);
         }
-        Command::Mcp { path, group } => {
-            mcp::serve(&scope_of(group, path)?)?;
-        }
         Command::Setup { path, group } => {
             let g = group::from_env(group.as_deref());
-            // Validate early: writing a config that points at a nonexistent
-            // group would fail only later, inside the agent's MCP client.
             if let Some(name) = g.as_deref() {
-                group::scope(Some(name), &root_of(None))?;
+                group::roots(Some(name), &root_of(None))?;
             }
             setup::run(&root_of(path), g.as_deref())?;
         }

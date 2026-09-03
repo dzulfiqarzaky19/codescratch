@@ -22,11 +22,11 @@ codescratch status               # trust banner
 codescratch explore <Symbol>     # banner + source + calls + callers (blast)
 codescratch search <name>        # FTS fuzzy find
 codescratch ensure               # bring graph up to date (host-owned, single-flight)
-codescratch mcp                  # MCP stdio server (explore + status listed)
+codescratch setup                # global skill + Pi host; strips leftover MCP
 ```
 
 Root selection: arg path → `CODESCRATCH_ROOT` env → cwd.
-Extra MCP tools: `CODESCRATCH_MCP_TOOLS=search`.
+If cwd is the unique parent of a registered group, commands fan out over that group.
 
 ## What's implemented (v0.1)
 
@@ -37,7 +37,7 @@ Extra MCP tools: `CODESCRATCH_MCP_TOOLS=search`.
 - host `ensure` under an `O_EXCL` single-flight lock; git HEAD → `indexed_head`;
   `reindex_state=rebuilding` so readers never see torn data.
 - 3-axis trust banner (freshness × coverage × graph quality).
-- MCP stdio: `explore` + `status` listed; `search` behind the env allowlist.
+- CLI only. Agent surface is a skill (`codescratch explore|search|status|changes`).
 
 ## Deferred (v0.2+)
 

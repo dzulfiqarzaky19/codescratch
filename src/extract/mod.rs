@@ -5,12 +5,12 @@
 use crate::model::{Edge, FileFacts, Lang, RawCall, Symbol};
 use tree_sitter::{Node, Parser};
 
-pub mod heuristics;
-pub mod plugins;
-pub mod python;
-mod walk;
+mod ast;
+mod heuristics;
+mod plugins;
+mod python;
 
-use walk::{push_binding, Ctx};
+use ast::{push_binding, Ctx};
 
 fn language(lang: Lang) -> Option<tree_sitter::Language> {
     Some(match lang {
@@ -27,28 +27,32 @@ pub fn extract(path_rel: &str, src: &str) -> FileFacts {
         return facts;
     };
     if lang == Lang::Py {
-        return python::extract(path_rel, src);
+        facts = python::extract(path_rel, src);
+    } else if let Some(ts_lang) = language(lang) {
+        let mut parser = Parser::new();
+        if parser.set_language(&ts_lang).is_ok() {
+            if let Some(tree) = parser.parse(src, None) {
+                let bytes = src.as_bytes();
+                let mut ctx = Ctx {
+                    file: path_rel,
+                    bytes,
+                    enclosing: None,
+                    class: None,
+                    facts: &mut facts,
+                };
+                visit(tree.root_node(), &mut ctx);
+            }
+        }
     }
-    let Some(ts_lang) = language(lang) else {
-        return facts; // known language, grammar not yet linked
-    };
-    let mut parser = Parser::new();
-    if parser.set_language(&ts_lang).is_err() {
-        return facts;
-    }
-    let Some(tree) = parser.parse(src, None) else {
-        return facts;
-    };
-    let bytes = src.as_bytes();
-    let mut ctx = Ctx {
-        file: path_rel,
-        bytes,
-        enclosing: None,
-        class: None,
-        facts: &mut facts,
-    };
-    visit(tree.root_node(), &mut ctx);
+    enrich(&mut facts, path_rel, src);
     facts
+}
+
+/// Heuristic edges + framework routes. Same call as the AST walk so index never
+/// names those adapters.
+fn enrich(facts: &mut FileFacts, path_rel: &str, src: &str) {
+    facts.extra = heuristics::extra_edges(path_rel, src, facts);
+    facts.routes = plugins::collect(path_rel, src);
 }
 
 fn is_exported(n: Node) -> bool {
@@ -58,7 +62,7 @@ fn is_exported(n: Node) -> bool {
 }
 
 fn signature(n: Node, bytes: &[u8]) -> String {
-    let full = walk::text(n, bytes);
+    let full = ast::text(n, bytes);
     let cut = full.find(['{', '\n']).unwrap_or(full.len());
     let mut s = full[..cut].trim().to_string();
     if s.len() > 200 {
@@ -72,16 +76,16 @@ fn visit(node: Node, ctx: &mut Ctx) {
         "function_declaration" | "generator_function_declaration" => {
             if let Some(name) = node.child_by_field_name("name") {
                 let id = push_symbol(ctx, node, name, "function", None);
-                walk::recurse_with(node, ctx, Some(id), ctx.class.clone(), visit);
+                ast::recurse_with(node, ctx, Some(id), ctx.class.clone(), visit);
                 return;
             }
         }
         "class_declaration" | "abstract_class_declaration" => {
             if let Some(name) = node.child_by_field_name("name") {
-                let nm = walk::text(name, ctx.bytes).to_string();
+                let nm = ast::text(name, ctx.bytes).to_string();
                 let id = push_symbol(ctx, node, name, "class", None);
                 record_heritage(node, ctx, &id);
-                walk::recurse_with(node, ctx, ctx.enclosing.clone(), Some((nm, id)), visit);
+                ast::recurse_with(node, ctx, ctx.enclosing.clone(), Some((nm, id)), visit);
                 return;
             }
         }
@@ -90,9 +94,9 @@ fn visit(node: Node, ctx: &mut Ctx) {
                 let qual = ctx
                     .class
                     .as_ref()
-                    .map(|(c, _)| format!("{c}.{}", walk::text(name, ctx.bytes)));
+                    .map(|(c, _)| format!("{c}.{}", ast::text(name, ctx.bytes)));
                 let id = push_symbol(ctx, node, name, "method", qual);
-                walk::recurse_with(node, ctx, Some(id), ctx.class.clone(), visit);
+                ast::recurse_with(node, ctx, Some(id), ctx.class.clone(), visit);
                 return;
             }
         }
@@ -117,7 +121,7 @@ fn visit(node: Node, ctx: &mut Ctx) {
                         if name.kind() == "identifier" {
                             let id =
                                 push_symbol_exported(ctx, decl, name, "function", None, exported);
-                            walk::recurse_with(decl, ctx, Some(id), ctx.class.clone(), visit);
+                            ast::recurse_with(decl, ctx, Some(id), ctx.class.clone(), visit);
                             continue;
                         }
                     }
@@ -159,7 +163,7 @@ fn push_symbol_exported(
     qual: Option<String>,
     exported: bool,
 ) -> String {
-    walk::push_symbol(
+    ast::push_symbol(
         ctx,
         def,
         name,
@@ -175,9 +179,9 @@ fn record_call(node: Node, ctx: &mut Ctx) {
         return;
     };
     let (name, member) = match callee.kind() {
-        "identifier" => (walk::text(callee, ctx.bytes).to_string(), false),
+        "identifier" => (ast::text(callee, ctx.bytes).to_string(), false),
         "member_expression" => match callee.child_by_field_name("property") {
-            Some(p) => (walk::text(p, ctx.bytes).to_string(), true),
+            Some(p) => (ast::text(p, ctx.bytes).to_string(), true),
             None => return,
         },
         _ => return,
@@ -202,7 +206,7 @@ fn record_imports(node: Node, ctx: &mut Ctx) {
     let Some(src) = node.child_by_field_name("source") else {
         return;
     };
-    let module = walk::text(src, ctx.bytes)
+    let module = ast::text(src, ctx.bytes)
         .trim_matches(['"', '\'', '`'])
         .to_string();
     if module.is_empty() {
@@ -220,13 +224,13 @@ fn record_imports(node: Node, ctx: &mut Ctx) {
                 "identifier" => push_binding(
                     ctx,
                     &module,
-                    walk::text(part, ctx.bytes),
+                    ast::text(part, ctx.bytes),
                     "default",
                     "default",
                 ),
                 "namespace_import" => {
                     if let Some(id) = part.named_child(0) {
-                        push_binding(ctx, &module, walk::text(id, ctx.bytes), "*", "namespace");
+                        push_binding(ctx, &module, ast::text(id, ctx.bytes), "*", "namespace");
                     }
                 }
                 "named_imports" => {
@@ -237,11 +241,11 @@ fn record_imports(node: Node, ctx: &mut Ctx) {
                         }
                         let orig = spec
                             .child_by_field_name("name")
-                            .map(|n| walk::text(n, ctx.bytes).to_string())
+                            .map(|n| ast::text(n, ctx.bytes).to_string())
                             .unwrap_or_default();
                         let local = spec
                             .child_by_field_name("alias")
-                            .map(|n| walk::text(n, ctx.bytes).to_string())
+                            .map(|n| ast::text(n, ctx.bytes).to_string())
                             .unwrap_or_else(|| orig.clone());
                         push_binding(ctx, &module, &local, &orig, "named");
                     }
@@ -266,7 +270,7 @@ fn record_reexports(node: Node, ctx: &mut Ctx) {
     let Some(src) = src else {
         return;
     };
-    let module = walk::text(src, ctx.bytes)
+    let module = ast::text(src, ctx.bytes)
         .trim_matches(['"', '\'', '`'])
         .to_string();
     if module.is_empty() {
@@ -285,11 +289,11 @@ fn record_reexports(node: Node, ctx: &mut Ctx) {
                     }
                     let orig = spec
                         .child_by_field_name("name")
-                        .map(|n| walk::text(n, ctx.bytes).to_string())
+                        .map(|n| ast::text(n, ctx.bytes).to_string())
                         .unwrap_or_default();
                     let local = spec
                         .child_by_field_name("alias")
-                        .map(|n| walk::text(n, ctx.bytes).to_string())
+                        .map(|n| ast::text(n, ctx.bytes).to_string())
                         .unwrap_or_else(|| orig.clone());
                     push_binding(ctx, &module, &local, &orig, "named-reexport");
                 }
@@ -300,7 +304,7 @@ fn record_reexports(node: Node, ctx: &mut Ctx) {
                     push_binding(
                         ctx,
                         &module,
-                        walk::text(id, ctx.bytes),
+                        ast::text(id, ctx.bytes),
                         "*",
                         "namespace-reexport",
                     );
@@ -361,13 +365,13 @@ fn collect_type_names(node: Node, bytes: &[u8], mut f: impl FnMut(&str, usize)) 
     fn rec(node: Node, bytes: &[u8], f: &mut impl FnMut(&str, usize)) {
         match node.kind() {
             "identifier" | "type_identifier" => {
-                let t = walk::text(node, bytes);
+                let t = ast::text(node, bytes);
                 if !t.is_empty() {
                     f(t, node.start_position().row + 1);
                 }
             }
             "member_expression" => {
-                let t = walk::text(node, bytes);
+                let t = ast::text(node, bytes);
                 if !t.is_empty() {
                     f(t, node.start_position().row + 1);
                 }

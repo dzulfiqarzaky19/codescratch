@@ -146,24 +146,70 @@ impl Registry {
     }
 }
 
-/// Resolve the active scope: `Some(group)` → its member roots (error if the
-/// group is unknown), `None` → the single `root`. One place so every command
-/// gets the same semantics.
-pub fn scope(group: Option<&str>, root: &Path) -> Result<Vec<PathBuf>> {
+/// Member roots for a group name, or auto-detect from `root`.
+/// `Some(group)` → that group's members (error if unknown).
+/// `None` → unique parent of one group fans out; a member stays that repo;
+/// else the single `root`.
+pub fn roots(group: Option<&str>, root: &Path) -> Result<Vec<PathBuf>> {
     match group {
-        Some(g) => {
-            let roots = load()?.roots(g)?;
-            if roots.is_empty() {
-                return Err(anyhow!("group '{g}' has no roots (add one: codescratch group add --group {g} --root <path>)"));
-            }
-            Ok(roots)
-        }
-        None => Ok(vec![root.to_path_buf()]),
+        Some(g) => named_roots(g),
+        None => Ok(infer(root)),
     }
 }
 
-/// Group name from `--group` or the `CODESCRATCH_GROUP` env var, so a host or
-/// MCP client can pin a group once instead of on every call.
+fn named_roots(g: &str) -> Result<Vec<PathBuf>> {
+    let roots = load()?.roots(g)?;
+    if roots.is_empty() {
+        return Err(anyhow!(
+            "group '{g}' has no roots (add one: codescratch group add --group {g} --root <path>)"
+        ));
+    }
+    Ok(roots)
+}
+
+/// Cwd / given path → group members when the match is unique.
+///
+/// - `root` equals a member → that one repo (agent in kabana-app stays there).
+/// - `root` is the unique parent of every member of exactly one group
+///   (`/kabana` for group `kabana`) → that group.
+/// - Ambiguous (parent of two groups, or member of none) → single `root`.
+/// Failures to load the registry degrade to single-root, never error: a missing
+/// `groups.json` must not break `codescratch status` in a normal repo.
+pub fn infer(root: &Path) -> Vec<PathBuf> {
+    let Ok(reg) = load() else {
+        return vec![root.to_path_buf()];
+    };
+    infer_in(&reg, root)
+}
+
+fn infer_in(reg: &Registry, root: &Path) -> Vec<PathBuf> {
+    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+
+    // member match: stay in that repo. First unique member wins; a path that
+    // is a member of two groups is still one repo, so we do not fan out.
+    for (_name, entry) in &reg.groups {
+        if entry.roots.iter().any(|r| r == &canon) {
+            return vec![canon];
+        }
+    }
+
+    let mut parent_hits: Vec<&GroupEntry> = Vec::new();
+    for (_name, entry) in &reg.groups {
+        if entry.roots.is_empty() {
+            continue;
+        }
+        if entry.roots.iter().all(|r| r.parent() == Some(canon.as_path())) {
+            parent_hits.push(entry);
+        }
+    }
+    if parent_hits.len() == 1 {
+        return parent_hits[0].roots.clone();
+    }
+    vec![canon]
+}
+
+/// Group name from `--group` or the `CODESCRATCH_GROUP` env var, so a host can
+/// pin a group once instead of on every call.
 pub fn from_env(explicit: Option<&str>) -> Option<String> {
     explicit
         .map(|s| s.to_string())
@@ -395,5 +441,64 @@ mod tests {
         assert!(run_in(&store, "bogus-action", None, None).is_err());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn infer_member_stays_in_that_repo() {
+        let parent = temp_root("infer-parent");
+        let app = parent.join("app");
+        let api = parent.join("api");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&api).unwrap();
+
+        let mut reg = Registry::default();
+        reg.add("k", &app).unwrap();
+        reg.add("k", &api).unwrap();
+
+        let one = infer_in(&reg, &app);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0], fs::canonicalize(&app).unwrap());
+
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn infer_unique_parent_fans_out() {
+        let parent = temp_root("infer-fan");
+        let app = parent.join("app");
+        let api = parent.join("api");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&api).unwrap();
+
+        let mut reg = Registry::default();
+        reg.add("k", &app).unwrap();
+        reg.add("k", &api).unwrap();
+
+        let all = infer_in(&reg, &parent);
+        assert_eq!(all.len(), 2);
+
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn infer_ambiguous_parent_stays_single() {
+        let parent = temp_root("infer-ambig");
+        let app = parent.join("app");
+        let api = parent.join("api");
+        let extra = parent.join("extra");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&api).unwrap();
+        fs::create_dir_all(&extra).unwrap();
+
+        let mut reg = Registry::default();
+        reg.add("k", &app).unwrap();
+        reg.add("k", &api).unwrap();
+        reg.add("other", &extra).unwrap();
+
+        let hit = infer_in(&reg, &parent);
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0], fs::canonicalize(&parent).unwrap());
+
+        let _ = fs::remove_dir_all(&parent);
     }
 }

@@ -56,15 +56,11 @@ s="$("$BIN" search helper --path "$tmp")"
 echo "$s" | grep -q "helper"                    || fail "search miss" "$s"
 pass "search (FTS5) finds helper"
 
-# 5. MCP stdio: initialize + tools/list returns exactly explore + status
-mcp="$(printf '%s\n%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-  | "$BIN" mcp "$tmp")"
-echo "$mcp" | grep -q '"name":"explore"'        || fail "explore tool not listed" "$mcp"
-echo "$mcp" | grep -q '"name":"status"'         || fail "status tool not listed" "$mcp"
-echo "$mcp" | grep -q '"name":"search"'         && fail "search should be hidden by default" "$mcp"
-pass "MCP lists exactly explore + status"
+# 5. MCP is gone: `mcp` subcommand must not exist
+if "$BIN" mcp "$tmp" >/dev/null 2>&1; then
+  fail "mcp subcommand still exists" ""
+fi
+pass "mcp subcommand removed"
 
 # 6. tsconfig alias + export * barrel resolve as import-binding (WP-2A)
 mkdir -p "$tmp/src/lib" "$tmp/src/services"

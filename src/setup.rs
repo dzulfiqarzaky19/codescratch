@@ -1,64 +1,42 @@
-//! Write MCP client config for detected agents. WP-2E.
-//! Claude / Cursor / Codex / opencode. Never overwrites an existing
-//! codescratch entry; merges into existing mcp json.
+//! Install the global skill + Pi host extension. Strip leftover codescratch
+//! MCP entries so an old `lifecycle: eager` config cannot spawn a server
+//! we no longer ship.
 
-use anyhow::{anyhow, Result};
-use serde_json::{json, Value};
+use anyhow::Result;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+const SKILL_MD: &str = include_str!("../skills/codescratch/SKILL.md");
+const PI_EXT: &str = include_str!("../host/pi-codescratch.ts");
+
 pub fn run(root: &Path, group: Option<&str>) -> Result<()> {
-    let bin = current_bin()?;
     let mut wrote = Vec::new();
+    let mut stripped = Vec::new();
 
-    if let Some(p) = claude_config() {
-        if merge_mcp(&p, "codescratch", &bin, root, group)? {
-            wrote.push(p);
-        }
-    }
-    if let Some(p) = cursor_config() {
-        if merge_mcp(&p, "codescratch", &bin, root, group)? {
-            wrote.push(p);
-        }
-    }
-    if let Some(p) = opencode_config() {
-        if merge_mcp(&p, "codescratch", &bin, root, group)? {
-            wrote.push(p);
-        }
-    }
-    // Codex: project-local .codex/mcp.json if the dir exists, else skip
-    let codex = root.join(".codex").join("mcp.json");
-    if root.join(".codex").is_dir() || std::env::var_os("CODEX_HOME").is_some() {
-        let p = std::env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
-            .map(|h| h.join("mcp.json"))
-            .unwrap_or(codex);
-        if merge_mcp(&p, "codescratch", &bin, root, group)? {
-            wrote.push(p);
-        }
-    }
+    wrote.extend(write_skill()?);
+    wrote.extend(write_pi_extension()?);
 
-    // Always write a project-local .mcp.json so any agent can pick it up.
-    let local = root.join(".mcp.json");
-    merge_mcp(&local, "codescratch", &bin, root, group)?;
-    wrote.push(local);
+    for p in mcp_candidates(root) {
+        if strip_codescratch_mcp(&p)? {
+            stripped.push(p);
+        }
+    }
 
     println!("codescratch setup");
-    println!("  binary: {}", bin.display());
     println!("  root:   {}", root.display());
     if let Some(g) = group {
-        println!("  group:  {g} (server fans out over its repos)");
+        println!("  group:  {g} (validated; CLI auto-detects unique parent cwd)");
     }
     for p in &wrote {
         println!("  wrote:  {}", p.display());
     }
-    if wrote.is_empty() {
-        println!("  (no agent configs detected; wrote nothing beyond .mcp.json)");
+    for p in &stripped {
+        println!("  stripped codescratch MCP: {}", p.display());
+    }
+    if wrote.is_empty() && stripped.is_empty() {
+        println!("  (nothing to write)");
     }
     Ok(())
-}
-
-fn current_bin() -> Result<PathBuf> {
-    std::env::current_exe().map_err(|e| anyhow!("cannot locate codescratch binary: {e}"))
 }
 
 fn home() -> PathBuf {
@@ -68,74 +46,95 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn claude_config() -> Option<PathBuf> {
-    let p = home().join(".claude").join("mcp.json");
-    if home().join(".claude").is_dir() {
-        Some(p)
-    } else {
-        None
+fn write_skill() -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    // Write into a harness that already exists. Create `skills/` if missing,
+    // but do not invent ~/.pi on a Claude-only machine (and vice versa).
+    let dests = [
+        (home().join(".pi").join("agent"), home().join(".pi").join("agent").join("skills").join("codescratch")),
+        (home().join(".claude"), home().join(".claude").join("skills").join("codescratch")),
+    ];
+    for (harness, dir) in dests {
+        if !harness.exists() {
+            continue;
+        }
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("SKILL.md");
+        std::fs::write(&path, SKILL_MD)?;
+        out.push(path);
     }
+    Ok(out)
 }
 
-fn cursor_config() -> Option<PathBuf> {
-    let p = home().join(".cursor").join("mcp.json");
-    if home().join(".cursor").is_dir() {
-        Some(p)
-    } else {
-        None
+fn write_pi_extension() -> Result<Vec<PathBuf>> {
+    let dir = home().join(".pi").join("agent").join("extensions");
+    if !dir.exists() && !home().join(".pi").join("agent").exists() {
+        return Ok(vec![]);
     }
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("codescratch.ts");
+    std::fs::write(&path, PI_EXT)?;
+    // drop the old PostToolUse-only ensure hook if it is still sitting there
+    let _ = std::fs::remove_file(dir.join("codescratch-ensure.ts"));
+    let _ = std::fs::remove_file(dir.join("codescratch-ensure.ts.disabled"));
+    Ok(vec![path])
 }
 
-fn opencode_config() -> Option<PathBuf> {
-    let p = home().join(".opencode").join("mcp.json");
-    if home().join(".opencode").is_dir() {
-        Some(p)
-    } else {
-        None
+fn mcp_candidates(root: &Path) -> Vec<PathBuf> {
+    let mut v = vec![
+        home().join(".claude").join("mcp.json"),
+        home().join(".cursor").join("mcp.json"),
+        home().join(".opencode").join("mcp.json"),
+        home().join(".pi").join("agent").join("mcp.json"),
+        home().join(".config").join("mcp").join("mcp.json"),
+        root.join(".mcp.json"),
+        root.join(".pi").join("mcp.json"),
+        root.join(".codex").join("mcp.json"),
+    ];
+    if let Ok(codex) = std::env::var("CODEX_HOME") {
+        v.push(PathBuf::from(codex).join("mcp.json"));
     }
+    // walk one level of children so a workspace parent (e.g. /kabana) strips
+    // leftover eager servers in kabana-app/.pi/mcp.json etc.
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.is_dir() {
+                v.push(p.join(".pi").join("mcp.json"));
+                v.push(p.join(".mcp.json"));
+            }
+        }
+    }
+    v
 }
 
-fn merge_mcp(
-    path: &Path,
-    name: &str,
-    bin: &Path,
-    root: &Path,
-    group: Option<&str>,
-) -> Result<bool> {
-    let mut root_obj: Value = if path.exists() {
-        let raw = std::fs::read_to_string(path)?;
-        serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
-    } else {
-        json!({})
+/// Remove the `codescratch` key under `mcpServers` or `mcp`. Leaves other
+/// servers alone. Missing / unreadable file → no-op. Returns true if a write happened.
+fn strip_codescratch_mcp(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    let mut root_obj: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
     };
     if !root_obj.is_object() {
-        root_obj = json!({});
+        return Ok(false);
     }
-    let mcp_servers = if root_obj.get("mcpServers").is_some() {
-        "mcpServers"
-    } else if root_obj.get("mcp").is_some() {
-        "mcp"
-    } else {
-        "mcpServers"
-    };
-    if root_obj.get(mcp_servers).is_none() {
-        root_obj[mcp_servers] = json!({});
+    let mut changed = false;
+    for key in ["mcpServers", "mcp"] {
+        if let Some(servers) = root_obj.get_mut(key).and_then(|v| v.as_object_mut()) {
+            if servers.remove("codescratch").is_some() {
+                changed = true;
+            }
+        }
     }
-    // `--group` makes every served tool fan out over the group's repos; the
-    // root stays as the fallback scope when the group is later removed.
-    let mut args: Vec<String> = vec!["mcp".into(), root.to_string_lossy().into_owned()];
-    if let Some(g) = group {
-        args.push("--group".into());
-        args.push(g.to_string());
-    }
-    let entry = json!({
-        "command": bin.to_string_lossy(),
-        "args": args,
-    });
-    root_obj[mcp_servers][name] = entry;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if !changed {
+        return Ok(false);
     }
     let pretty = serde_json::to_string_pretty(&root_obj)?;
     std::fs::write(path, pretty)?;
@@ -147,59 +146,57 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[test]
-    fn merge_does_not_clobber_other_servers() {
-        let dir = std::env::temp_dir().join(format!("cs-setup-{}", std::process::id()));
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("cs-setup-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn strip_removes_codescratch_keeps_others() {
+        let dir = tmp("strip");
         let p = dir.join("mcp.json");
-        fs::write(&p, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
-        merge_mcp(
+        fs::write(
             &p,
-            "codescratch",
-            Path::new("/bin/codescratch"),
-            Path::new("/repo"),
-            None,
+            r#"{"mcpServers":{"other":{"command":"x"},"codescratch":{"command":"cs"}}}"#,
         )
         .unwrap();
+        assert!(strip_codescratch_mcp(&p).unwrap());
         let v: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
         assert!(v["mcpServers"]["other"].is_object());
-        assert_eq!(
-            v["mcpServers"]["codescratch"]["command"],
-            "/bin/codescratch"
-        );
-        assert_eq!(v["mcpServers"]["codescratch"]["args"][0], "mcp");
-        assert_eq!(
-            v["mcpServers"]["codescratch"]["args"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
+        assert!(v["mcpServers"].get("codescratch").is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn merge_with_group_appends_group_flag() {
-        let dir = std::env::temp_dir().join(format!("cs-setup-group-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+    fn strip_noop_when_absent() {
+        let dir = tmp("absent");
         let p = dir.join("mcp.json");
-        merge_mcp(
-            &p,
-            "codescratch",
-            Path::new("/bin/codescratch"),
-            Path::new("/repo"),
-            Some("svc"),
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap();
-        let args = v["mcpServers"]["codescratch"]["args"]
-            .as_array()
-            .unwrap()
-            .clone();
-        assert_eq!(args[2], "--group");
-        assert_eq!(args[3], "svc");
+        fs::write(&p, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
+        assert!(!strip_codescratch_mcp(&p).unwrap());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_missing_file_is_ok() {
+        let dir = tmp("missing");
+        assert!(!strip_codescratch_mcp(&dir.join("nope.json")).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_empty_object_ok() {
+        let dir = tmp("empty");
+        let p = dir.join("mcp.json");
+        fs::write(&p, "{}").unwrap();
+        assert!(!strip_codescratch_mcp(&p).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn include_skill_is_nonempty() {
+        assert!(SKILL_MD.contains("codescratch explore"));
+        assert!(PI_EXT.contains("session_start"));
     }
 }

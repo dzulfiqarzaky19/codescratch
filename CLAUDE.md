@@ -1,8 +1,6 @@
 # codescratch
 
-Local TS/JS code structure graph for AI agents. SQLite under `<repo>/.codescratch/`. MCP + CLI.
-
-**Not coupled to memory-agent.** Hosts may load both MCP servers; no shared state.
+Local TS/JS code structure graph for AI agents. SQLite under `<repo>/.codescratch/`. CLI + skill. No MCP.
 
 ## Hybrid freshness (host-owned)
 
@@ -10,13 +8,13 @@ Graph currency is **host** work (`codescratch ensure` + Claude Code hooks), not 
 
 | Layer | Owner |
 |-------|--------|
-| Index freshness | Host: SessionStart + PostToolUse → `ensure` (single-flight, debounced) |
-| Deep structure | Agent MCP: explore / callers / impact / search |
-| Emergency rebuild | Agent `cs_reindex` only if host path down or trust stuck |
+| Index freshness | Host: `codescratch watch` (session) + SessionStart `ensure` (catch-up) |
+| Deep structure | Agent CLI: `codescratch explore` / `search` / `changes` |
+| Emergency rebuild | `codescratch reindex` only if host path down or trust stuck |
 
 ### Agent protocol
 
-1. Prefer structural tools over blind grep for “where defined / who calls / blast radius”.
+1. Prefer `codescratch explore` / `search` over blind grep for “where defined / who calls / blast radius”.
 2. Read all three axes every reply — `trust:` (freshness), `coverage:` (how much was verified), `graph:` (resolution quality).
    - `rebuilding` → host job in flight; **absence ≠ proof**; do not spam reindex.
    - `stale` → host ensure should catch up; `cs_reindex` only if stuck.
@@ -28,12 +26,12 @@ Graph currency is **host** work (`codescratch ensure` + Claude Code hooks), not 
 
 | Tool | When |
 |------|------|
-| `cs_status` | Graph missing/stale/rebuilding? |
-| `cs_explore` | One symbol: snippet + spine + members + calls + callers + routes/processes. Miss inlines nearby search hits. |
-| `cs_search` | Fuzzy find. CLI always; MCP only if `CODESCRATCH_MCP_TOOLS=search`. |
-| `cs_reindex` | **Emergency** only (same lock as host ensure) |
+| `codescratch status` | Graph missing/stale/rebuilding? |
+| `codescratch explore` | One symbol: snippet + spine + members + calls + callers + routes/processes. Miss inlines nearby search hits. |
+| `codescratch search` | Fuzzy find. |
+| `codescratch reindex` | **Emergency** only (same lock as host ensure) |
 
-Optional `root` on every tool for monorepos (else `CODESCRATCH_ROOT` / cwd).
+Optional path arg / `CODESCRATCH_ROOT` / cwd. Cwd that is the unique parent of a registered group fans out.
 
 ### Multi-repo groups
 
@@ -46,13 +44,12 @@ codescratch ensure  --group pay      # indexes each member, sequential
 codescratch status  --group pay      # merged banner + one line per repo
 codescratch search  helper --group pay
 codescratch explore chargeCard --group pay
-codescratch setup   --group pay      # MCP server serves the group
-codescratch mcp . --group pay
+codescratch setup   --group pay      # skill is global; validates group exists
 ```
 
 `--group` on any command, or `CODESCRATCH_GROUP=pay` to pin it.
 
-`--group` works on `ensure`, `reindex`, `status`, `search`, `explore`, `changes`, `watch`, `mcp`, `setup`.
+`--group` works on `ensure`, `reindex`, `status`, `search`, `explore`, `changes`, `watch`, `setup`.
 
 - Group banner = worst-wins per axis + summed counts, suffixed `[group: N repos]`. One `stale` member makes the group `stale`.
 - `search --group` prefixes hits `[repo]`. Ranking is per-repo; scores across separate indexes are not comparable.
@@ -102,17 +99,16 @@ Single Rust crate (`Cargo.toml` at repo root; the original TS port has been remo
 
 ```
 src/
-  extract/     tree-sitter TS/JS/Python + import bindings (plugins/ for route frameworks)
-  index.rs     walk, hash, scoped resolve, incremental dirty-gate
+  extract/     tree-sitter TS/JS/Python + import bindings; FileFacts includes heritage, heuristic edges, routes
+  index.rs     walk, hash, store; resolve owns specifier→file + edge honesty
   host.rs      ensure/reindex lock + git HEAD (host freshness)
   scope.rs     Scope: the roots a command acts on; owns the one-vs-many rule
-  query.rs     explore/search/status + trust; hybrid search via embeddings.rs
-  analysis.rs  communities (label propagation) + processes (call chains)
+  query.rs     explore/search/status (gather + markdown adapter live here)
+  analysis/    communities (label propagation) + processes (call chains)
   embeddings.rs  local feature-hash embeddings + RRF hybrid search
   group.rs     multi-repo groups (~/.codescratch/groups.json)
   db.rs        rusqlite graph (bundled build → static, FTS5)
-  mcp.rs       MCP stdio
-  main.rs      CLI (init | ensure | reindex | status | explore | search | mcp | setup | watch | changes | group)
+  main.rs      CLI (init | ensure | reindex | status | explore | search | setup | watch | changes | group)
 tests/         golden.sh (e2e) + bench.sh (perf harness)
 ```
 

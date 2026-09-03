@@ -69,6 +69,29 @@ pub fn compute(conn: &Connection, root: &Path) -> Result<Trust> {
     })
 }
 
+/// Short repo label for group output: the root directory name.
+pub fn repo_label(root: &Path) -> String {
+    root.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| root.display().to_string())
+}
+
+/// One repo's trust. Opens the graph; callers that already have a connection
+/// use [`compute`] instead.
+pub fn of(root: &Path) -> Result<Trust> {
+    let conn = db::open(root)?;
+    compute(&conn, root)
+}
+
+/// Trust for a member, or [`missing`] if the index cannot be read.
+/// Group callers must use this so a dead repo cannot hide behind the rest.
+pub fn or_missing(root: &Path) -> (Trust, Option<String>) {
+    match of(root) {
+        Ok(t) => (t, None),
+        Err(e) => (missing(), Some(e.to_string())),
+    }
+}
+
 /// The signature line. Always first.
 pub fn banner(t: &Trust) -> String {
     format!(
