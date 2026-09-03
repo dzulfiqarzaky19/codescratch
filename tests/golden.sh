@@ -40,6 +40,9 @@ pass "init reports trust: fresh · coverage: exhaustive"
 
 # 2. explore helper → cross-file caller resolved via import-binding, blast shows main.ts
 exp="$("$BIN" explore helper --path "$tmp")"
+pos="$("$BIN" explore helper "$tmp")"
+echo "$pos" | grep -q "import-binding" || fail "explore helper PATH positional missed" "$pos"
+pass "explore helper PATH positional works"
 echo "$exp" | grep -q "## function .helper."  || fail "explore header missing" "$exp"
 echo "$exp" | grep -q "import-binding"         || fail "no import-binding caller" "$exp"
 echo "$exp" | grep -q "src/main.ts"            || fail "blast radius missing main.ts" "$exp"
@@ -129,6 +132,12 @@ trap 'rm -rf "$tmp" "$second"' EXIT
 gout="$("$BIN" ensure --group golden)"
 echo "$gout" | grep -q "\[group: 2 repos\]" || fail "group banner missing repo count" "$gout"
 pass "ensure --group indexes every member repo"
+
+iout="$("$BIN" init --group golden)"
+echo "$iout" | grep -q "\[group: 2 repos\]" || fail "init --group missing group banner" "$iout"
+ready="$(echo "$iout" | grep -c "graph ready at" || true)"
+[ "$ready" -eq 2 ] || fail "init --group ready lines=$ready want 2" "$iout"
+pass "init --group prints a ready line per repo"
 
 gsearch="$("$BIN" search helper --group golden)"
 echo "$gsearch" | grep -q "$(basename "$second")\]" || fail "second repo missing from group search" "$gsearch"

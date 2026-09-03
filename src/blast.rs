@@ -17,6 +17,7 @@ pub const MAX_DEPTH: usize = 4;
 #[derive(Debug, Clone)]
 pub struct Hop {
     pub depth: usize,
+    #[allow(dead_code)] // asserted in blast tests; query/changes never read it
     src_id: String,
     pub node: Option<NodeRow>,
     pub file_path: String,

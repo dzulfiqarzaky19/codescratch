@@ -10,6 +10,8 @@ const want = {
   "rg FIXME": null,
   "rg HACK": null,
   "rg XXX": null,
+  "rg todo": null,
+  "rg Todo": null,
   "rg -i TODO": null,
   "rg helper src/": null,
   "rg -e helper": null,

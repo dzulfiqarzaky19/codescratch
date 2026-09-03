@@ -39,7 +39,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Create the graph store and build it once.
-    Init { path: Option<PathBuf> },
+    Init {
+        path: Option<PathBuf>,
+        /// Init every repo in this group instead of one root.
+        #[arg(long)]
+        group: Option<String>,
+    },
     /// Bring the graph up to date (host-owned freshness, single-flight).
     Ensure {
         path: Option<PathBuf>,
@@ -63,7 +68,10 @@ enum Command {
     /// One symbol → banner + source + calls + callers (blast radius).
     Explore {
         symbol: String,
-        #[arg(long)]
+        /// Repo root. Positional; `--path` is the same value (older callers).
+        #[arg(value_name = "PATH")]
+        path_pos: Option<PathBuf>,
+        #[arg(long = "path", value_name = "PATH")]
         path: Option<PathBuf>,
         /// Explore across every repo in this group.
         #[arg(long)]
@@ -72,7 +80,10 @@ enum Command {
     /// Fuzzy find a symbol by name.
     Search {
         query: String,
-        #[arg(long)]
+        /// Repo root. Positional; `--path` is the same value (older callers).
+        #[arg(value_name = "PATH")]
+        path_pos: Option<PathBuf>,
+        #[arg(long = "path", value_name = "PATH")]
         path: Option<PathBuf>,
         /// Search every repo in this group.
         #[arg(long)]
@@ -124,15 +135,20 @@ fn scope_of(group: Option<String>, path: Option<PathBuf>) -> Result<Scope> {
     Scope::resolve(group.as_deref(), &root_of(path))
 }
 
+fn pick_path(positional: Option<PathBuf>, flag: Option<PathBuf>) -> Option<PathBuf> {
+    positional.or(flag)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Init { path } => {
-            let scope = scope_of(None, path.clone())?;
+        Command::Init { path, group } => {
+            let scope = scope_of(group, path)?;
             scope.ensure(false)?;
             println!("{}", scope.status()?);
-            let root = &scope.roots()[0];
-            println!("graph ready at {}/.codescratch/graph.db", root.display());
+            for root in scope.roots() {
+                println!("graph ready at {}/.codescratch/graph.db", root.display());
+            }
         }
         Command::Ensure { path, group } => {
             let scope = scope_of(group, path)?;
@@ -149,17 +165,25 @@ fn main() -> Result<()> {
         }
         Command::Explore {
             symbol,
+            path_pos,
             path,
             group,
         } => {
-            println!("{}", scope_of(group, path)?.explore(&symbol)?);
+            println!(
+                "{}",
+                scope_of(group, pick_path(path_pos, path))?.explore(&symbol)?
+            );
         }
         Command::Search {
             query: q,
+            path_pos,
             path,
             group,
         } => {
-            println!("{}", scope_of(group, path)?.search(&q)?);
+            println!(
+                "{}",
+                scope_of(group, pick_path(path_pos, path))?.search(&q)?
+            );
         }
         Command::Setup { path, group } => {
             let g = group::from_env(group.as_deref());

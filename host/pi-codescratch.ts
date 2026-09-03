@@ -19,7 +19,7 @@ const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const NOT_SYMBOL = new Set(["TODO", "FIXME", "HACK", "XXX"]);
 
 function isSymbolIdent(q: string): boolean {
-	return IDENT.test(q) && !NOT_SYMBOL.has(q);
+	return IDENT.test(q) && !NOT_SYMBOL.has(q.toUpperCase());
 }
 
 function bin(): string | null {
@@ -36,7 +36,7 @@ function kick(args: string[], cwd: string): ChildProcess | null {
 	const child = spawn(b, args, {
 		cwd,
 		detached: true,
-		stdio: "ignore",
+		stdio: ["ignore", "ignore", "inherit"],
 	});
 	child.unref();
 	return child;
