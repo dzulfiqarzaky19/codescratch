@@ -15,10 +15,10 @@ Graph currency is **host** work (`codescratch ensure` + Claude Code hooks), not 
 ### Agent protocol
 
 1. Prefer `codescratch explore` / `search` over blind grep for “where defined / who calls / blast radius”.
-2. Read all three axes every reply — `trust:` (freshness), `coverage:` (how much was verified), `graph:` (resolution quality).
+2. Read all three axes every reply — `trust:` (freshness), `coverage:` (how much was verified), `resolve:` (in-repo bind rate).
    - `rebuilding` → host job in flight; **absence ≠ proof**; do not spam reindex.
-   - `stale` → host ensure should catch up; `cs_reindex` only if stuck.
-   - `coverage: sampled` / `graph: degraded` / `conf=weak` / `fresh but …` → do not treat absence as proof.
+   - `trust: stale` → HEAD moved; host `ensure` should catch up; `cs_reindex` only if stuck.
+   - `coverage: sampled` / `resolve: partial` / `conf=weak` → do not treat absence as proof. **Not stale.**
 3. **Do not** call `cs_reindex` after every edit or every turn.
 4. Critical paths (auth, money, deletes): verify by reading source. Graph misses dynamic `import()`, DI, proxies.
 
@@ -64,7 +64,7 @@ codescratch setup   --group pay      # skill is global; validates group exists
 - `weak` — a name guess. Verify before acting.
 - `rebuilding` — host ensure holds the lock; wait.
 - Unresolved package imports stay open
-- Axes are orthogonal: `graph: degraded` is normal with external deps and says nothing about freshness; `coverage: sampled` means unread files, not drift
+- Axes are orthogonal: `resolve: partial` is unbound in-repo calls and says nothing about freshness; `coverage: sampled` means unread files, not drift
 
 Every resolved edge carries `reason=`:
 

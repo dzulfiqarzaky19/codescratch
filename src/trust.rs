@@ -8,9 +8,9 @@ use rusqlite::Connection;
 use std::path::Path;
 
 pub struct Trust {
-    pub trust: String,    // fresh | stale | rebuilding | missing
+    pub trust: String,    // fresh | stale | rebuilding | missing  (HEAD vs indexed_head)
     pub coverage: String, // exhaustive | sampled
-    pub graph: String,    // ok | degraded
+    pub resolve: String,  // ok | partial  (in-repo bind rate — not freshness)
     pub files: i64,
     pub nodes: i64,
     pub edges: i64,
@@ -44,16 +44,15 @@ pub fn compute(conn: &Connection, root: &Path) -> Result<Trust> {
     // --- coverage axis --- (full-rebuild indexer visits every file → exhaustive)
     let coverage = db::get_meta(conn, "coverage")?.unwrap_or_else(|| "exhaustive".to_string());
 
-    // --- graph axis --- in-repo resolution quality, not freshness.
-    // `external-import` (node_modules / builtins) and `receiver-unknown`
-    // (`.map` / `.toBe` with no typed receiver) are expected on real TS.
-    // Counting them as failures made every kabana repo `degraded` forever.
-    let graph = graph_quality(conn)?;
+    // --- resolve axis --- in-repo bind rate, NOT freshness.
+    // Must not share vocabulary with `trust:` (`stale`/`fresh`) or agents
+    // treat a quality flag as "index is behind".
+    let resolve = resolve_quality(conn)?;
 
     Ok(Trust {
         trust,
         coverage,
-        graph,
+        resolve,
         files,
         nodes,
         edges,
@@ -63,7 +62,7 @@ pub fn compute(conn: &Connection, root: &Path) -> Result<Trust> {
 /// In-repo call/heritage resolution. Honesty labels that are *not* misses:
 /// `external-import`, `receiver-unknown`, and `unresolved` whose name is not
 /// a graph node (`expect`/`it`/`Number`/`sql`). Empty in-scope set → `ok`.
-fn graph_quality(conn: &Connection) -> Result<String> {
+fn resolve_quality(conn: &Connection) -> Result<String> {
     let (in_scope, resolved): (i64, i64) = conn.query_row(
         "SELECT COUNT(*), COALESCE(SUM(resolved), 0)
          FROM edges e
@@ -79,7 +78,7 @@ fn graph_quality(conn: &Connection) -> Result<String> {
     Ok(if in_scope == 0 || (resolved as f64) / (in_scope as f64) >= 0.6 {
         "ok".into()
     } else {
-        "degraded".into()
+        "partial".into()
     })
 }
 
@@ -109,8 +108,8 @@ pub fn or_missing(root: &Path) -> (Trust, Option<String>) {
 /// The signature line. Always first.
 pub fn banner(t: &Trust) -> String {
     format!(
-        "trust: {} · coverage: {} · graph: {}  ({} files, {} symbols, {} edges)",
-        t.trust, t.coverage, t.graph, t.files, t.nodes, t.edges
+        "trust: {} · coverage: {} · resolve: {}  ({} files, {} symbols, {} edges)",
+        t.trust, t.coverage, t.resolve, t.files, t.nodes, t.edges
     )
 }
 
@@ -131,7 +130,7 @@ pub fn missing() -> Trust {
     Trust {
         trust: "missing".into(),
         coverage: "exhaustive".into(),
-        graph: "ok".into(),
+        resolve: "ok".into(),
         files: 0,
         nodes: 0,
         edges: 0,
@@ -156,15 +155,15 @@ pub fn merge(parts: &[Trust]) -> Trust {
     } else {
         "exhaustive".to_string()
     };
-    let graph = if parts.iter().any(|t| t.graph != "ok") {
-        "degraded".to_string()
+    let resolve = if parts.iter().any(|t| t.resolve != "ok") {
+        "partial".to_string()
     } else {
         "ok".to_string()
     };
     Trust {
         trust: worst,
         coverage,
-        graph,
+        resolve,
         files: parts.iter().map(|t| t.files).sum(),
         nodes: parts.iter().map(|t| t.nodes).sum(),
         edges: parts.iter().map(|t| t.edges).sum(),
@@ -216,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_ok_when_in_repo_calls_resolve() {
+    fn resolve_ok_when_in_repo_calls_resolve() {
         let conn = mem();
         edge(&conn, "calls", "import-binding", 1, "helper");
         edge(&conn, "calls", "same-file", 1, "run");
@@ -226,25 +225,25 @@ mod tests {
             edge(&conn, "calls", "external-import", 0, "expect");
             edge(&conn, "calls", "unresolved", 0, "expect"); // no node named expect
         }
-        assert_eq!(graph_quality(&conn).unwrap(), "ok");
+        assert_eq!(resolve_quality(&conn).unwrap(), "ok");
     }
 
     #[test]
-    fn graph_degraded_when_in_repo_calls_do_not_resolve() {
+    fn resolve_partial_when_in_repo_calls_do_not_resolve() {
         let conn = mem();
         conn.execute("INSERT INTO nodes(name) VALUES('helper')", [])
             .unwrap();
         edge(&conn, "calls", "unresolved", 0, "helper");
         edge(&conn, "calls", "unresolved", 0, "helper");
         edge(&conn, "calls", "import-binding", 1, "run");
-        assert_eq!(graph_quality(&conn).unwrap(), "degraded");
+        assert_eq!(resolve_quality(&conn).unwrap(), "partial");
     }
 
-    fn t(trust: &str, coverage: &str, graph: &str) -> Trust {
+    fn t(trust: &str, coverage: &str, resolve: &str) -> Trust {
         Trust {
             trust: trust.into(),
             coverage: coverage.into(),
-            graph: graph.into(),
+            resolve: resolve.into(),
             files: 1,
             nodes: 2,
             edges: 3,
@@ -255,11 +254,11 @@ mod tests {
     fn merge_takes_worst_axis_and_sums_counts() {
         let m = merge(&[
             t("fresh", "exhaustive", "ok"),
-            t("stale", "sampled", "degraded"),
+            t("stale", "sampled", "partial"),
         ]);
         assert_eq!(m.trust, "stale");
         assert_eq!(m.coverage, "sampled");
-        assert_eq!(m.graph, "degraded");
+        assert_eq!(m.resolve, "partial");
         assert_eq!((m.files, m.nodes, m.edges), (2, 4, 6));
     }
 
