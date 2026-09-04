@@ -44,20 +44,11 @@ pub fn compute(conn: &Connection, root: &Path) -> Result<Trust> {
     // --- coverage axis --- (full-rebuild indexer visits every file → exhaustive)
     let coverage = db::get_meta(conn, "coverage")?.unwrap_or_else(|| "exhaustive".to_string());
 
-    // --- graph axis --- resolution quality, not freshness
-    let resolved: i64 = conn
-        .query_row("SELECT COUNT(*) FROM edges WHERE resolved = 1", [], |r| {
-            r.get(0)
-        })
-        .unwrap_or(0);
-    let graph = if edges == 0 {
-        "ok"
-    } else if (resolved as f64) / (edges as f64) < 0.6 {
-        "degraded"
-    } else {
-        "ok"
-    }
-    .to_string();
+    // --- graph axis --- in-repo resolution quality, not freshness.
+    // `external-import` (node_modules / builtins) and `receiver-unknown`
+    // (`.map` / `.toBe` with no typed receiver) are expected on real TS.
+    // Counting them as failures made every kabana repo `degraded` forever.
+    let graph = graph_quality(conn)?;
 
     Ok(Trust {
         trust,
@@ -66,6 +57,29 @@ pub fn compute(conn: &Connection, root: &Path) -> Result<Trust> {
         files,
         nodes,
         edges,
+    })
+}
+
+/// In-repo call/heritage resolution. Honesty labels that are *not* misses:
+/// `external-import`, `receiver-unknown`, and `unresolved` whose name is not
+/// a graph node (`expect`/`it`/`Number`/`sql`). Empty in-scope set → `ok`.
+fn graph_quality(conn: &Connection) -> Result<String> {
+    let (in_scope, resolved): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(resolved), 0)
+         FROM edges e
+         WHERE e.kind IN ('calls','extends','implements')
+           AND (
+             e.reason IN ('import-binding','same-file','unique-global')
+             OR (e.reason = 'unresolved'
+                 AND EXISTS (SELECT 1 FROM nodes n WHERE n.name = e.raw_name))
+           )",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(if in_scope == 0 || (resolved as f64) / (in_scope as f64) >= 0.6 {
+        "ok".into()
+    } else {
+        "degraded".into()
     })
 }
 
@@ -177,6 +191,54 @@ pub fn render_group(parts: &[Trust], repos: usize, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mem() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE edges (
+                resolved INTEGER NOT NULL DEFAULT 0,
+                kind TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                raw_name TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE nodes (name TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn edge(conn: &rusqlite::Connection, kind: &str, reason: &str, resolved: i64, raw: &str) {
+        conn.execute(
+            "INSERT INTO edges(kind, reason, resolved, raw_name) VALUES(?1, ?2, ?3, ?4)",
+            (kind, reason, resolved, raw),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn graph_ok_when_in_repo_calls_resolve() {
+        let conn = mem();
+        edge(&conn, "calls", "import-binding", 1, "helper");
+        edge(&conn, "calls", "same-file", 1, "run");
+        // noise that used to drag a healthy repo under 0.6
+        for _ in 0..10 {
+            edge(&conn, "calls", "receiver-unknown", 0, "map");
+            edge(&conn, "calls", "external-import", 0, "expect");
+            edge(&conn, "calls", "unresolved", 0, "expect"); // no node named expect
+        }
+        assert_eq!(graph_quality(&conn).unwrap(), "ok");
+    }
+
+    #[test]
+    fn graph_degraded_when_in_repo_calls_do_not_resolve() {
+        let conn = mem();
+        conn.execute("INSERT INTO nodes(name) VALUES('helper')", [])
+            .unwrap();
+        edge(&conn, "calls", "unresolved", 0, "helper");
+        edge(&conn, "calls", "unresolved", 0, "helper");
+        edge(&conn, "calls", "import-binding", 1, "run");
+        assert_eq!(graph_quality(&conn).unwrap(), "degraded");
+    }
 
     fn t(trust: &str, coverage: &str, graph: &str) -> Trust {
         Trust {
