@@ -1,13 +1,13 @@
-//! The moat: three orthogonal freshness axes, rendered as the first line of
-//! every explore/status payload. Ported from codescratch `src/query/trust.ts`
-//! + `format.ts`. Neither parent tool has this.
+//! The Banner: Trust × Coverage × Resolve, rendered as the first line of
+//! every explore/status payload. Trust is one axis (HEAD vs indexed_head),
+//! not the payload.
 
 use crate::{db, git};
 use anyhow::Result;
 use rusqlite::Connection;
 use std::path::Path;
 
-pub struct Trust {
+pub struct Banner {
     pub trust: String,    // fresh | stale | rebuilding | missing  (HEAD vs indexed_head)
     pub coverage: String, // exhaustive | sampled
     pub resolve: String,  // ok | partial  (in-repo bind rate — not freshness)
@@ -16,7 +16,7 @@ pub struct Trust {
     pub edges: i64,
 }
 
-pub fn compute(conn: &Connection, root: &Path) -> Result<Trust> {
+pub fn compute(conn: &Connection, root: &Path) -> Result<Banner> {
     let files = db::count(conn, "files")?;
     let nodes = db::count(conn, "nodes")?;
     let edges = db::count(conn, "edges")?;
@@ -49,7 +49,7 @@ pub fn compute(conn: &Connection, root: &Path) -> Result<Trust> {
     // treat a quality flag as "index is behind".
     let resolve = resolve_quality(conn)?;
 
-    Ok(Trust {
+    Ok(Banner {
         trust,
         coverage,
         resolve,
@@ -89,16 +89,16 @@ pub fn repo_label(root: &Path) -> String {
         .unwrap_or_else(|| root.display().to_string())
 }
 
-/// One repo's trust. Opens the graph; callers that already have a connection
+/// One repo's Banner. Opens the graph; callers that already have a connection
 /// use [`compute`] instead.
-pub fn of(root: &Path) -> Result<Trust> {
+pub fn of(root: &Path) -> Result<Banner> {
     let conn = db::open(root)?;
     compute(&conn, root)
 }
 
-/// Trust for a member, or [`missing`] if the index cannot be read.
+/// Banner for a member, or [`missing`] if the index cannot be read.
 /// Group callers must use this so a dead repo cannot hide behind the rest.
-pub fn or_missing(root: &Path) -> (Trust, Option<String>) {
+pub fn or_missing(root: &Path) -> (Banner, Option<String>) {
     match of(root) {
         Ok(t) => (t, None),
         Err(e) => (missing(), Some(e.to_string())),
@@ -106,7 +106,7 @@ pub fn or_missing(root: &Path) -> (Trust, Option<String>) {
 }
 
 /// The signature line. Always first.
-pub fn banner(t: &Trust) -> String {
+pub fn banner(t: &Banner) -> String {
     format!(
         "trust: {} · coverage: {} · resolve: {}  ({} files, {} symbols, {} edges)",
         t.trust, t.coverage, t.resolve, t.files, t.nodes, t.edges
@@ -124,10 +124,10 @@ fn trust_rank(s: &str) -> u8 {
     }
 }
 
-/// Trust for a member whose index could not be read. Counts stay zero so the
-/// merge still sums; the freshness axis is `missing`, which ranks worst.
-pub fn missing() -> Trust {
-    Trust {
+/// Banner for a member whose index could not be read. Counts stay zero so the
+/// merge still sums; Trust is `missing`, which ranks worst.
+pub fn missing() -> Banner {
+    Banner {
         trust: "missing".into(),
         coverage: "exhaustive".into(),
         resolve: "ok".into(),
@@ -137,11 +137,11 @@ pub fn missing() -> Trust {
     }
 }
 
-/// Fold per-repo trust into one group-level trust. Counts sum; each axis takes
+/// Fold per-repo Banners into one group-level Banner. Counts sum; each axis takes
 /// the worst member value, so a group banner never over-promises.
 /// Callers must include [`missing`] for unreadables — omitting them would let
 /// a dead member hide behind the remaining `fresh` repos.
-pub fn merge(parts: &[Trust]) -> Trust {
+pub fn merge(parts: &[Banner]) -> Banner {
     if parts.is_empty() {
         return missing();
     }
@@ -160,7 +160,7 @@ pub fn merge(parts: &[Trust]) -> Trust {
     } else {
         "ok".to_string()
     };
-    Trust {
+    Banner {
         trust: worst,
         coverage,
         resolve,
@@ -172,13 +172,13 @@ pub fn merge(parts: &[Trust]) -> Trust {
 
 /// Group banner: the normal signature line plus the repo count, so the agent
 /// can see it is reading a fan-out and not one repo.
-fn banner_group(t: &Trust, repos: usize) -> String {
+fn banner_group(t: &Banner, repos: usize) -> String {
     format!("{}  [group: {} repos]", banner(t), repos)
 }
 
 /// One group payload: merged banner, then the per-repo body. Shared by status,
 /// search, explore, and changes so the merge rule is not re-typed at each call.
-pub fn render_group(parts: &[Trust], repos: usize, body: &str) -> String {
+pub fn render_group(parts: &[Banner], repos: usize, body: &str) -> String {
     let head = banner_group(&merge(parts), repos);
     if body.is_empty() {
         head
@@ -239,8 +239,8 @@ mod tests {
         assert_eq!(resolve_quality(&conn).unwrap(), "partial");
     }
 
-    fn t(trust: &str, coverage: &str, resolve: &str) -> Trust {
-        Trust {
+    fn t(trust: &str, coverage: &str, resolve: &str) -> Banner {
+        Banner {
             trust: trust.into(),
             coverage: coverage.into(),
             resolve: resolve.into(),

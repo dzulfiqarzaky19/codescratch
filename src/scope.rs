@@ -124,8 +124,8 @@ impl Scope {
     /// `None` omits the member from the body; the banner still counts it.
     fn fold_group(
         &self,
-        mut body_of: impl FnMut(&Path, &str, &trust::Trust, Option<&str>) -> Result<Option<String>>,
-    ) -> Result<(Vec<trust::Trust>, String)> {
+        mut body_of: impl FnMut(&Path, &str, &trust::Banner, Option<&str>) -> Result<Option<String>>,
+    ) -> Result<(Vec<trust::Banner>, String)> {
         let mut parts = Vec::new();
         let mut body = String::new();
         for root in &self.roots {
@@ -141,7 +141,7 @@ impl Scope {
 
     fn map_group(
         &self,
-        body_of: impl FnMut(&Path, &str, &trust::Trust, Option<&str>) -> Result<Option<String>>,
+        body_of: impl FnMut(&Path, &str, &trust::Banner, Option<&str>) -> Result<Option<String>>,
     ) -> Result<String> {
         let (parts, body) = self.fold_group(body_of)?;
         Ok(trust::render_group(&parts, self.roots.len(), &body))
