@@ -126,9 +126,28 @@ fn visit(node: Node, ctx: &mut Ctx) {
                         }
                     }
                 }
+                // Plain consts only at module scope: function locals would flood the graph.
+                if ctx.enclosing.is_none() && ctx.class.is_none() {
+                    if let Some(name) = decl.child_by_field_name("name") {
+                        if name.kind() == "identifier" {
+                            push_symbol_exported(ctx, decl, name, "const", None, exported);
+                        }
+                    }
+                }
                 visit(decl, ctx);
             }
             return;
+        }
+        "interface_declaration" | "type_alias_declaration" | "enum_declaration" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                let kind = match node.kind() {
+                    "interface_declaration" => "interface",
+                    "type_alias_declaration" => "type",
+                    _ => "enum",
+                };
+                push_symbol(ctx, node, name, kind, None);
+            }
+            // fall through: enum initializers may contain calls
         }
         "call_expression" => {
             record_call(node, ctx);
@@ -443,6 +462,30 @@ class Box {
             .symbols
             .iter()
             .any(|s| s.name == "add" && s.kind == "function" && s.exported));
+    }
+
+    #[test]
+    fn extracts_type_level_and_plain_const_symbols() {
+        let f = extract(
+            "src/a.ts",
+            "export interface Pet { name: string }\n\
+             export type Id = string;\n\
+             export enum Color { Red }\n\
+             export const MAX = 3;\n\
+             const local = { a: 1 };\n\
+             function f() { const x = 1; return x; }\n",
+        );
+        let has = |name: &str, kind: &str, exported: bool| {
+            f.symbols
+                .iter()
+                .any(|s| s.name == name && s.kind == kind && s.exported == exported)
+        };
+        assert!(has("Pet", "interface", true));
+        assert!(has("Id", "type", true));
+        assert!(has("Color", "enum", true));
+        assert!(has("MAX", "const", true));
+        assert!(has("local", "const", false));
+        assert!(!f.symbols.iter().any(|s| s.name == "x"));
     }
 
     #[test]

@@ -44,17 +44,10 @@ pub fn resolve_with_heritage(
     files: &HashSet<String>,
     cfg: &ResolveConfig,
 ) -> Vec<Edge> {
-    let mut global: HashMap<&str, Vec<&Symbol>> = HashMap::new();
-    let mut per_file: HashMap<&str, HashMap<&str, Vec<&Symbol>>> = HashMap::new();
-    for s in symbols {
-        global.entry(s.name.as_str()).or_default().push(s);
-        per_file
-            .entry(s.file_path.as_str())
-            .or_default()
-            .entry(s.name.as_str())
-            .or_default()
-            .push(s);
-    }
+    let (global, per_file) = symbol_maps(symbols.iter());
+    // Call sites never target a type: `const User` + `type User` must stay unique.
+    let (call_global, call_per_file) =
+        symbol_maps(symbols.iter().filter(|s| !is_type_only(&s.kind)));
     let mut binds: HashMap<&str, HashMap<&str, &ImportBinding>> = HashMap::new();
     let mut binds_by_file: HashMap<&str, Vec<&ImportBinding>> = HashMap::new();
     for b in bindings {
@@ -126,7 +119,7 @@ pub fn resolve_with_heritage(
                             b.imported_name.as_str()
                         };
                         if let Some(dst) =
-                            resolve_export(&per_file, &binds_by_file, files, cfg, &target, want, 0)
+                            resolve_export(&call_per_file, &binds_by_file, files, cfg, &target, want, 0)
                         {
                             e.dst_id = Some(dst.id.clone());
                             e.resolved = true;
@@ -148,7 +141,7 @@ pub fn resolve_with_heritage(
         }
 
         // 2. same-file (non-method, unique)
-        if let Some(cands) = per_file
+        if let Some(cands) = call_per_file
             .get(c.file_path.as_str())
             .and_then(|m| m.get(c.name.as_str()))
         {
@@ -165,7 +158,7 @@ pub fn resolve_with_heritage(
 
         // 3. receiver-unknown (member call: navigational only)
         if c.member {
-            if let Some(cands) = global.get(c.name.as_str()) {
+            if let Some(cands) = call_global.get(c.name.as_str()) {
                 e.reason = "receiver-unknown".into();
                 if cands.len() == 1 {
                     e.dst_id = Some(cands[0].id.clone());
@@ -179,7 +172,7 @@ pub fn resolve_with_heritage(
         }
 
         // 4. unique-global
-        if let Some(cands) = global.get(c.name.as_str()) {
+        if let Some(cands) = call_global.get(c.name.as_str()) {
             if cands.len() == 1 {
                 e.dst_id = Some(cands[0].id.clone());
                 e.resolved = true;
@@ -266,6 +259,32 @@ pub fn resolve_with_heritage(
     edges
 }
 
+type SymbolMaps<'a> = (
+    HashMap<&'a str, Vec<&'a Symbol>>,
+    HashMap<&'a str, HashMap<&'a str, Vec<&'a Symbol>>>,
+);
+
+/// `(by name, by file → by name)` over `symbols`.
+fn symbol_maps<'a>(symbols: impl Iterator<Item = &'a Symbol>) -> SymbolMaps<'a> {
+    let mut global: HashMap<&str, Vec<&Symbol>> = HashMap::new();
+    let mut per_file: HashMap<&str, HashMap<&str, Vec<&Symbol>>> = HashMap::new();
+    for s in symbols {
+        global.entry(s.name.as_str()).or_default().push(s);
+        per_file
+            .entry(s.file_path.as_str())
+            .or_default()
+            .entry(s.name.as_str())
+            .or_default()
+            .push(s);
+    }
+    (global, per_file)
+}
+
+/// Kinds that exist only at the type level (or can never be called).
+fn is_type_only(kind: &str) -> bool {
+    matches!(kind, "interface" | "type" | "enum")
+}
+
 fn resolve_export<'a>(
     per_file: &'a HashMap<&'a str, HashMap<&'a str, Vec<&'a Symbol>>>,
     binds_by_file: &HashMap<&str, Vec<&ImportBinding>>,
@@ -348,7 +367,9 @@ fn pick_in_file<'a>(
             let exported: Vec<&Symbol> = by_name
                 .values()
                 .flatten()
-                .filter(|s| s.exported)
+                // Sole exported function/class stands in for `default`; exported
+                // types and plain consts beside it must not break that guess.
+                .filter(|s| s.exported && matches!(s.kind.as_str(), "function" | "class"))
                 .copied()
                 .collect();
             if exported.len() == 1 {
@@ -730,6 +751,43 @@ mod tests {
         assert_eq!(e.reason, "import-binding");
         assert_eq!(e.conf, "strong");
         assert_eq!(e.dst_id.as_deref(), Some("util.ts#helper@1"));
+    }
+
+    #[test]
+    fn same_named_type_does_not_block_same_file_call() {
+        let syms = vec![
+            sym("a.ts#User@1", "User", "a.ts", "const", true),
+            sym("a.ts#User@2", "User", "a.ts", "type", true),
+            sym("a.ts#c@3", "c", "a.ts", "function", false),
+        ];
+        let calls = vec![call("a.ts#c@3", "User", false, "a.ts")];
+        let edges = resolve_with_heritage(&syms, &calls, &[], &[], &HashSet::new(), &ResolveConfig::default());
+        let e = call_edge(&edges);
+        assert_eq!(e.reason, "same-file");
+        assert_eq!(e.dst_id.as_deref(), Some("a.ts#User@1"));
+    }
+
+    #[test]
+    fn exported_types_do_not_break_sole_export_default() {
+        let syms = vec![
+            sym("comp.ts#Comp@1", "Comp", "comp.ts", "function", true),
+            sym("comp.ts#Props@2", "Props", "comp.ts", "interface", true),
+            sym("comp.ts#SIZE@3", "SIZE", "comp.ts", "const", true),
+            sym("a.ts#c@1", "c", "a.ts", "function", false),
+        ];
+        let calls = vec![call("a.ts#c@1", "Comp", false, "a.ts")];
+        let binds = vec![ImportBinding {
+            file_path: "a.ts".into(),
+            local_name: "Comp".into(),
+            source_module: "./comp".into(),
+            imported_name: "default".into(),
+            kind: "default".into(),
+        }];
+        let files: HashSet<String> = ["comp.ts", "a.ts"].iter().map(|s| s.to_string()).collect();
+        let edges = resolve_with_heritage(&syms, &calls, &binds, &[], &files, &ResolveConfig::default());
+        let e = call_edge(&edges);
+        assert_eq!(e.reason, "import-binding");
+        assert_eq!(e.dst_id.as_deref(), Some("comp.ts#Comp@1"));
     }
 
     #[test]
