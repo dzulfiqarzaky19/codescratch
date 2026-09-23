@@ -188,4 +188,7 @@ fresh="$("$BIN" status "$tmp")"
 echo "$fresh" | grep -q "trust: fresh" || fail "ensure did not clear HEAD-drift stale" "$fresh"
 pass "ensure clears trust:stale after empty commit"
 
+node "$here/claude-hook.mjs" "$BIN" >/dev/null || fail "claude host hook regression" "run tests/claude-hook.mjs"
+pass "claude host answers symbol greps, leaves the rest"
+
 echo "GOLDEN OK"

@@ -1,13 +1,22 @@
-//! Install the global skill + Pi host extension. Strip leftover codescratch
+//! Install the global skill + Pi host extension + Claude Code host hook. Strip leftover codescratch
 //! MCP entries so an old `lifecycle: eager` config cannot spawn a server
 //! we no longer ship.
 
 use anyhow::Result;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 const SKILL_MD: &str = include_str!("../skills/codescratch/SKILL.md");
 const PI_EXT: &str = include_str!("../host/pi-codescratch.ts");
+const CLAUDE_HOOK: &str = include_str!("../host/claude-codescratch.cjs");
+const CLAUDE_HOOK_FILE: &str = "codescratch-host.cjs";
+const CLAUDE_HOOK_CMD: &str = r#"node "$HOME/.claude/hooks/codescratch-host.cjs""#;
+/// (event, matcher) the Claude Code host listens on.
+const CLAUDE_EVENTS: [(&str, Option<&str>); 3] = [
+    ("SessionStart", None),
+    ("PreToolUse", Some("Grep|Bash")),
+    ("PostToolUse", Some("Edit|Write|MultiEdit")),
+];
 
 pub fn run(root: &Path, group: Option<&str>) -> Result<()> {
     let mut wrote = Vec::new();
@@ -15,6 +24,7 @@ pub fn run(root: &Path, group: Option<&str>) -> Result<()> {
 
     wrote.extend(write_skill()?);
     wrote.extend(write_pi_extension()?);
+    wrote.extend(write_claude_hook()?);
 
     for p in mcp_candidates(root) {
         if strip_codescratch_mcp(&p)? {
@@ -78,6 +88,71 @@ fn write_pi_extension() -> Result<Vec<PathBuf>> {
     let _ = std::fs::remove_file(dir.join("codescratch-ensure.ts"));
     let _ = std::fs::remove_file(dir.join("codescratch-ensure.ts.disabled"));
     Ok(vec![path])
+}
+
+fn write_claude_hook() -> Result<Vec<PathBuf>> {
+    let claude = home().join(".claude");
+    if !claude.exists() {
+        return Ok(vec![]);
+    }
+    let dir = claude.join("hooks");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(CLAUDE_HOOK_FILE);
+    std::fs::write(&path, CLAUDE_HOOK)?;
+    let mut out = vec![path];
+    let settings = claude.join("settings.json");
+    if register_claude_hooks(&settings)? {
+        out.push(settings);
+    }
+    Ok(out)
+}
+
+/// Make `settings.json` carry exactly one codescratch-host entry per event, keeping
+/// every other key and hook in place. Unparseable file → left alone. Returns true on write.
+fn register_claude_hooks(path: &Path) -> Result<bool> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),
+        Err(_) => return Ok(false),
+    };
+    let mut root_obj: Value = match serde_json::from_str(&raw) {
+        Ok(v @ Value::Object(_)) => v,
+        _ => {
+            eprintln!(
+                "  skipped: {} is not a JSON object; add the codescratch-host hooks by hand",
+                path.display()
+            );
+            return Ok(false);
+        }
+    };
+    let before = root_obj.clone();
+    let Some(hooks) = root_obj
+        .as_object_mut()
+        .map(|o| o.entry("hooks").or_insert_with(|| json!({})))
+        .and_then(|h| h.as_object_mut())
+    else {
+        return Ok(false);
+    };
+    for (event, matcher) in CLAUDE_EVENTS {
+        let Some(groups) = hooks
+            .entry(event)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+        else {
+            continue;
+        };
+        groups.retain(|g| !g.to_string().contains(CLAUDE_HOOK_FILE));
+        let cmd = json!([{ "type": "command", "command": CLAUDE_HOOK_CMD }]);
+        groups.push(match matcher {
+            Some(m) => json!({ "matcher": m, "hooks": cmd }),
+            None => json!({ "hooks": cmd }),
+        });
+    }
+    if root_obj == before {
+        return Ok(false);
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&root_obj)? + "\n")?;
+    Ok(true)
 }
 
 fn mcp_candidates(root: &Path) -> Vec<PathBuf> {
@@ -198,5 +273,43 @@ mod tests {
     fn include_skill_is_nonempty() {
         assert!(SKILL_MD.contains("codescratch explore"));
         assert!(PI_EXT.contains("session_start"));
+        assert!(CLAUDE_HOOK.contains("SessionStart"));
+    }
+
+    #[test]
+    fn register_claude_hooks_is_idempotent_and_keeps_order() {
+        let dir = tmp("claude");
+        let p = dir.join("settings.json");
+        fs::write(
+            &p,
+            r#"{"zeta":1,"hooks":{"PreToolUse":[{"matcher":"Read","hooks":[{"type":"command","command":"node guard.cjs"}]},{"matcher":"Grep","hooks":[{"type":"command","command":"node old/codescratch-host.cjs"}]}]},"alpha":2}"#,
+        )
+        .unwrap();
+        assert!(register_claude_hooks(&p).unwrap());
+        assert!(!register_claude_hooks(&p).unwrap());
+        let raw = fs::read_to_string(&p).unwrap();
+        assert!(raw.find("zeta").unwrap() < raw.find("alpha").unwrap());
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        for (event, _) in CLAUDE_EVENTS {
+            let n = v["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|g| g.to_string().contains(CLAUDE_HOOK_FILE))
+                .count();
+            assert_eq!(n, 1, "{event}");
+        }
+        assert!(v["hooks"]["PreToolUse"].to_string().contains("guard.cjs"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn register_claude_hooks_leaves_bad_json_alone() {
+        let dir = tmp("badjson");
+        let p = dir.join("settings.json");
+        fs::write(&p, "{ not json").unwrap();
+        assert!(!register_claude_hooks(&p).unwrap());
+        assert_eq!(fs::read_to_string(&p).unwrap(), "{ not json");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
