@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(here, "..", "host", "claude-codescratch.cjs");
 const BIN = path.resolve(process.argv[2] || path.join(here, "..", "target", "debug", "codescratch"));
-const { fromBash, fromGrepTool } = createRequire(import.meta.url)(HOOK);
+const { fromBash, fromGrepTool, splitChain, planBash } = createRequire(import.meta.url)(HOOK);
 
 let failed = 0;
 const check = (label, ok) => {
@@ -49,6 +49,34 @@ check("grep tool -i", fromGrepTool({ pattern: "Foo", "-i": true }, "/r") === nul
 check("grep tool md glob", fromGrepTool({ pattern: "Foo", glob: "*.md" }, "/r") === null);
 check("grep tool regex", fromGrepTool({ pattern: "Foo\\(" }, "/r") === null);
 
+// --- batches: split rejoins byte-for-byte, only symbol segments are planned ---
+for (const cmd of [
+  `echo "=== a; b ==="; rg -n Foo src && grep -rn 'x|y' . || true`,
+  "cd /x && grep -rn Foo src 2>&1 | head -5\nls",
+]) {
+  const parts = splitChain(cmd);
+  check(`split rejoins ${JSON.stringify(cmd)}`, parts.map((p) => p.text + p.sep).join("") === cmd);
+}
+for (const cmd of ["echo $(rg Foo)", "rg Foo &", "cat <<EOF\nFoo\nEOF", "echo 'open"]) {
+  check(`split refuses ${JSON.stringify(cmd)}`, splitChain(cmd) === null);
+}
+const plans = {
+  "rg Foo src | head -30": { idents: ["Foo"], only: true },
+  "cd /x && grep -rn \"Foo\" src --include=*.ts 2>/dev/null | head -n 20": { idents: ["Foo"], only: true },
+  'echo "=== callers ==="; grep -rn Foo src; rg Bar': { idents: ["Foo", "Bar"], only: false },
+  "ls prisma/ ; grep -rln OrderItem prisma/ | head": { idents: ["OrderItem"], only: false },
+  "rg Foo src | wc -l": null,
+  "grep -rn 'Foo\\|Bar' src; ls": null,
+  "rg -i Foo; ls": null,
+  "cat a | grep Foo": null,
+};
+for (const [cmd, want] of Object.entries(plans)) {
+  const got = planBash(cmd, "/r");
+  const shape = got ? { idents: got.hits.map((h) => h.ident), only: got.only } : null;
+  check(`plan ${JSON.stringify(cmd)} => ${JSON.stringify(shape)}`, JSON.stringify(shape) === JSON.stringify(want));
+}
+check("plan tracks cd", planBash("cd /x; rg Foo sub; ls", "/r").hits[0].dir === "/x/sub");
+
 // --- end to end on a fixture repo ---
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cs-hook-"));
 const repo = path.join(tmp, "repo");
@@ -84,6 +112,26 @@ check("outside scope silent", grep(plain, "helper") === null);
 
 const first = grep(repo, "helper", "s3");
 check("first touch mid-session adds the note", /^codescratch graph active/.test(first?.hookSpecificOutput?.additionalContext || ""));
+
+// Bash: a lone symbol grep with an output trim is denied like the Grep tool.
+const sh = (command, session) =>
+  run({ hook_event_name: "PreToolUse", session_id: session, cwd: repo, tool_name: "Bash", tool_input: { command, description: "d" } });
+const lone = sh("grep -rn Pet src 2>/dev/null | head -20", "s4");
+check("bash lone grep denies", lone?.hookSpecificOutput?.permissionDecision === "deny");
+check("file-scoped grep runs", sh("grep -n helper src/a.ts; ls", "s4") === null);
+
+// Bash batch: only the hit segment is rewritten, the rest runs, and no decision is taken.
+const batch = `echo BEFORE; rg -n Pet src | head -3 && rg -n nothingHere src; echo AFTER`;
+const rw = sh(batch, "s5")?.hookSpecificOutput;
+check("batch takes no permission decision", rw && rw.permissionDecision === undefined);
+check("batch keeps other tool_input fields", rw?.updatedInput?.description === "d");
+const cmd = rw?.updatedInput?.command || "";
+check("batch rewrites the hit segment", /^echo BEFORE; cat '[^']+' && rg -n nothingHere src; echo AFTER$/.test(cmd));
+check("answer file sits in the repo's .codescratch", cmd.includes(`cat '${path.join(repo, ".codescratch", "answers")}`));
+const ran = spawnSync("bash", ["-c", cmd], { cwd: repo, encoding: "utf8" });
+check("rewritten batch runs the answer and the rest", /BEFORE[\s\S]*answered from the graph[\s\S]*## [\s\S]*Pet[\s\S]*AFTER/.test(ran.stdout));
+check("repeat batch runs raw", sh(batch, "s5") === null);
+check("batch with only misses untouched", sh("rg nothingHere src; ls", "s5") === null);
 
 fs.rmSync(tmp, { recursive: true, force: true });
 if (failed) process.exit(1);

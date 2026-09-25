@@ -6,6 +6,8 @@
  * SessionStart            → ensure (catch-up) + one short note, only inside a codescratch scope
  * PreToolUse Grep|Bash    → bare-identifier grep answered by `codescratch explore`:
  *                           hit  = deny, the reason carries the answer (no extra turn)
+ *                           hit inside a batch (`;` `&&` `||`) = that segment rewritten to a
+ *                                  `cat` of the answer, the rest runs (updatedInput, no decision)
  *                           miss = grep runs untouched; a repeat of a served grep runs untouched
  * PostToolUse Edit|Write  → ensure for the edited file's repo (host lock coalesces bursts)
  *
@@ -189,6 +191,87 @@ function fromBash(command, cwd) {
   return { ident, dir: positional[1] ? expand(positional[1], base) : base };
 }
 
+/** Output trims the graph answer makes moot: `| head -N`, `| tail -N`, `2>/dev/null`, `2>&1`. */
+const TRIM_TAIL = /(?:\s*\|\s*(?:head|tail)(?:\s+-n)?(?:\s+-?\d+)?|\s+2>\s*\/dev\/null|\s+2>&1)+\s*$/;
+/** Explore calls one hook run may spend (3s timeout each). */
+const MAX_REWRITES = 4;
+
+/** Quote-aware split on top-level `;` `&&` `||` and newlines → [{ text, sep }], joinable back
+ *  byte-for-byte. null for substitutions, heredocs, process substitution or background jobs:
+ *  never rewrite what this cannot parse. */
+function splitChain(command) {
+  const s = String(command);
+  if (/\$\(|`|<<|<\(|>\(/.test(s)) return null;
+  const parts = [];
+  let cur = "";
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (q) {
+      cur += ch;
+      if (ch === q) q = null;
+      else if (ch === "\\" && q === '"') cur += s[++i] ?? "";
+      continue;
+    }
+    if (ch === "\\") {
+      cur += ch + (s[i + 1] ?? "");
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      q = ch;
+      cur += ch;
+      continue;
+    }
+    if (ch === ";" || ch === "\n") {
+      parts.push({ text: cur, sep: ch });
+      cur = "";
+      continue;
+    }
+    if ((ch === "&" || ch === "|") && s[i + 1] === ch) {
+      parts.push({ text: cur, sep: ch + ch });
+      cur = "";
+      i++;
+      continue;
+    }
+    if (ch === "&") {
+      if (s[i - 1] === ">" || s[i + 1] === ">") {
+        cur += ch; // 2>&1, &>
+        continue;
+      }
+      return null;
+    }
+    cur += ch;
+  }
+  if (q) return null;
+  parts.push({ text: cur, sep: "" });
+  return parts;
+}
+
+/** Bash command → { parts, hits: [{ i, ident, dir }], only } or null. `only`: nothing but
+ *  `cd`s and one symbol grep, so the whole call can be answered; otherwise segments are rewritten. */
+function planBash(command, cwd) {
+  const parts = splitChain(command);
+  if (!parts) return null;
+  let dir = cwd;
+  let others = 0;
+  const hits = [];
+  parts.forEach((p, i) => {
+    const t = p.text.trim();
+    if (!t) return;
+    const cd = t.match(/^cd\s+(\S+)$/);
+    if (cd) {
+      dir = expand(cd[1], dir);
+      return;
+    }
+    const target = fromBash(t.replace(TRIM_TAIL, ""), dir);
+    if (target) hits.push({ i, ...target });
+    else others++;
+  });
+  if (!hits.length) return null;
+  return { parts, hits, only: others === 0 && hits.length === 1 };
+}
+
 function explore(ident, scope) {
   const r = spawnSync(bin(), ["explore", ident], { cwd: scope, encoding: "utf8", timeout: 3000 });
   if (r.status !== 0 || typeof r.stdout !== "string") return null;
@@ -212,65 +295,132 @@ function onSessionStart(input) {
   emit({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: note(scope) } });
 }
 
-function onPreToolUse(input) {
-  const cwd = input.cwd || process.cwd();
-  const ti = input.tool_input || {};
-  const target =
-    input.tool_name === "Grep" ? fromGrepTool(ti, cwd) : input.tool_name === "Bash" ? fromBash(ti.command || "", cwd) : null;
-  if (!target) return;
+/** One symbol grep → { key, ident, repo, root, body }, or null when the grep should run (a file
+ *  path, outside a scope, a repeat, a miss). Pushes the first-touch note for a repo the session
+ *  did not start in. */
+function answerFor(target, st, session, notes) {
+  // A grep scoped to one file wants that file's lines, not the repo-wide graph answer.
+  if (!isDir(target.dir)) return null;
   const scope = scopeOf(target.dir);
-  if (!scope) return;
-
-  const st = loadState(input.session_id);
-  let context = "";
+  if (!scope) return null;
   if (!st.scopes.includes(scope)) {
     // First touch of a repo the session did not start in: catch it up and say so once.
     st.scopes.push(scope);
     kick(["ensure"], scope);
-    context = note(scope);
+    notes.push(note(scope));
   }
   const key = `${scope}\0${target.ident}`;
+  const repo = path.basename(scope);
   if (st.served[key]) {
     // Escape hatch: Claude asked twice, so it wants raw matches. Log it as waste.
-    metric({ decision: "allow", rule: "regrep", ident: target.ident, repo: path.basename(scope), session: input.session_id });
-    saveState(input.session_id, st);
-    if (context) emit({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: context } });
-    return;
+    metric({ decision: "allow", rule: "regrep", ident: target.ident, repo, session });
+    return null;
   }
-
   const answer = explore(target.ident, scope);
   if (!answer) {
-    metric({ decision: "allow", rule: "symbol-miss", ident: target.ident, repo: path.basename(scope), session: input.session_id });
-    saveState(input.session_id, st);
-    if (context) emit({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: context } });
-    return;
+    metric({ decision: "allow", rule: "symbol-miss", ident: target.ident, repo, session });
+    return null;
   }
-
-  st.served[key] = true;
-  saveState(input.session_id, st);
   const body =
     answer.length > MAX_ANSWER
       ? `${answer.slice(0, MAX_ANSWER)}\n… (truncated; run \`codescratch explore ${target.ident}\` for the rest)`
       : answer;
-  metric({
-    decision: "deny",
-    rule: "symbol-served",
-    ident: target.ident,
-    repo: path.basename(scope),
-    session: input.session_id,
-    explore_chars: body.length,
-  });
+  return { key, ident: target.ident, repo, root: findRoot(target.dir), body };
+}
+
+function contextOnly(notes) {
+  if (notes.length) emit({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: notes.join("\n") } });
+}
+
+/** The whole call is one symbol grep: deny it and hand back the answer (no extra turn). */
+function serveDeny(input, target) {
+  const st = loadState(input.session_id);
+  const notes = [];
+  const a = answerFor(target, st, input.session_id, notes);
+  if (a) st.served[a.key] = true;
+  saveState(input.session_id, st);
+  if (!a) return contextOnly(notes);
+  metric({ decision: "deny", rule: "symbol-served", ident: a.ident, repo: a.repo, session: input.session_id, explore_chars: a.body.length });
   const out = {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       permissionDecision: "deny",
       permissionDecisionReason:
         `codescratch answered this symbol lookup from the graph, so the grep was skipped. ` +
-        `If you need raw text matches, repeat the same grep once and it will run.\n\n${body}`,
+        `If you need raw text matches, repeat the same grep once and it will run.\n\n${a.body}`,
     },
   };
-  if (context) out.hookSpecificOutput.additionalContext = context;
+  if (notes.length) out.hookSpecificOutput.additionalContext = notes.join("\n");
   emit(out);
+}
+
+/** Answers live in the grepped repo's own `.codescratch/`, so reading one needs exactly the
+ *  directory access the grep needed: Claude Code's sandbox denies a `cat` outside the working
+ *  dirs even when `Bash(cat:*)` is allowed, and that denial takes the whole batch with it. */
+function answerFile(session, a) {
+  if (!a.root) return null;
+  const safe = String(session || "nosession").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
+  const f = path.join(a.root, ".codescratch", "answers", safe, `${a.ident}.md`);
+  try {
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(
+      f,
+      `# codescratch: grep for \`${a.ident}\` answered from the graph (repeat the same grep once for raw matches)\n${a.body}\n`,
+    );
+    return f;
+  } catch {
+    return null;
+  }
+}
+
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+/** Symbol greps inside a batch: swap each answered segment for a `cat` of its answer and let
+ *  the rest run. No permissionDecision, so the rewritten command goes through the normal
+ *  permission flow (verified on CC 2.1.282: an allow rule for the original did not cover it). */
+function serveRewrite(input, plan) {
+  const st = loadState(input.session_id);
+  const notes = [];
+  const texts = plan.parts.map((p) => p.text);
+  const local = new Map();
+  const served = [];
+  for (const h of plan.hits.slice(0, MAX_REWRITES)) {
+    const k = `${h.dir}\0${h.ident}`;
+    if (!local.has(k)) {
+      const a = answerFor(h, st, input.session_id, notes);
+      const file = a && answerFile(input.session_id, a);
+      local.set(k, file ? { ...a, file } : null);
+      if (file) {
+        st.served[a.key] = true;
+        served.push(a);
+      }
+    }
+    const got = local.get(k);
+    if (got) texts[h.i] = texts[h.i].replace(texts[h.i].trim(), `cat ${shq(got.file)}`);
+  }
+  saveState(input.session_id, st);
+  if (!served.length) return contextOnly(notes);
+  for (const a of served)
+    metric({ decision: "rewrite", rule: "symbol-rewrite", ident: a.ident, repo: a.repo, session: input.session_id, explore_chars: a.body.length });
+  const command = texts.map((t, i) => t + plan.parts[i].sep).join("");
+  const out = { hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { ...input.tool_input, command } } };
+  if (notes.length) out.hookSpecificOutput.additionalContext = notes.join("\n");
+  emit(out);
+}
+
+function onPreToolUse(input) {
+  const cwd = input.cwd || process.cwd();
+  const ti = input.tool_input || {};
+  if (input.tool_name === "Grep") {
+    const target = fromGrepTool(ti, cwd);
+    if (target) serveDeny(input, target);
+    return;
+  }
+  if (input.tool_name !== "Bash") return;
+  const plan = planBash(ti.command || "", cwd);
+  if (!plan) return;
+  if (plan.only) serveDeny(input, plan.hits[0]);
+  else serveRewrite(input, plan);
 }
 
 function onPostToolUse(input) {
@@ -302,4 +452,4 @@ if (require.main === module) {
   process.exit(0);
 }
 
-module.exports = { fromBash, fromGrepTool, scopeOf, isSymbolIdent };
+module.exports = { fromBash, fromGrepTool, scopeOf, isSymbolIdent, splitChain, planBash };

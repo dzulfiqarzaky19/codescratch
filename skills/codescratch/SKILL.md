@@ -5,7 +5,7 @@ description: TS/JS structure graph. Prefer over grep/rg for where a symbol is de
 
 Graph lives in `<repo>/.codescratch/graph.db`. Host keeps it fresh (`ensure` / `watch`). Do not reindex every turn.
 
-In Claude Code a bare-identifier grep inside a codescratch repo is answered from the graph: the grep is denied and the reason carries the `explore` answer. Use it. Repeat the same grep once only if you need raw text matches.
+In Claude Code a bare-identifier grep inside a codescratch repo is answered from the graph: a lone grep is denied and the reason carries the `explore` answer; inside a batch (`;` `&&` `||`) that segment prints the answer instead and the rest runs. Use it. Repeat the same grep once only if you need raw text matches. A grep scoped to one file always runs.
 
 ```
 codescratch status                         # trust × coverage × resolve
