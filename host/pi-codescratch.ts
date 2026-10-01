@@ -1,25 +1,60 @@
 /**
- * codescratch host for Pi: session watch + catch-up ensure + high-confidence
- * symbol-grep rewrite. No MCP.
+ * codescratch host for Pi: session watch + catch-up ensure + the grep rules of the
+ * Claude Code host. No MCP.
  *
  * session_start  → ensure (dirty-gate) + spawn `codescratch watch` (cwd-scoped)
  * session_shutdown → kill that watch
- * tool_call grep → identifier pattern blocked with the explore/search command
- * tool_call bash → `rg`/`grep` of a bare identifier rewritten to `codescratch explore`
+ * tool_call grep|bash → host/claude-codescratch.cjs decides (installed beside this file):
+ *                   a symbol grep is blocked and the reason carries the graph's answer,
+ *                   inside a batch it becomes a `cat` of that answer, and any other grep
+ *                   for matching lines gets `| codescratch fold` appended
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
-/** Convention markers — grep these, do not `explore`. */
-const NOT_SYMBOL = new Set(["TODO", "FIXME", "HACK", "XXX"]);
+/** What the Claude Code hook prints for a PreToolUse event. */
+type HookAnswer = {
+	hookSpecificOutput?: {
+		permissionDecision?: string;
+		permissionDecisionReason?: string;
+		updatedInput?: { command?: string };
+	};
+} | null;
 
-function isSymbolIdent(q: string): boolean {
-	return IDENT.test(q) && !NOT_SYMBOL.has(q.toUpperCase());
+const engine = createRequire(import.meta.url)("./claude-codescratch.cjs") as {
+	decide(input: Record<string, unknown>, stateDir: string): HookAnswer;
+};
+
+/** Session state and fold logs, apart from the Claude Code hook's own. */
+const STATE = join(homedir(), ".codescratch", "pi");
+
+export type Decision = { block: string } | { command: string } | null;
+
+/** One Pi `grep` or `bash` call → blocked with the graph's answer, a rewritten command, or
+ *  null when the call should run as written. */
+export function decide(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	session: string,
+	stateDir: string = STATE,
+): Decision {
+	const call =
+		toolName === "grep"
+			? { tool_name: "Grep", tool_input: { pattern: input.pattern, path: input.path, glob: input.glob, "-i": input.ignoreCase } }
+			: toolName === "bash"
+				? { tool_name: "Bash", tool_input: { command: input.command } }
+				: null;
+	if (!call) return null;
+	const out = engine.decide({ hook_event_name: "PreToolUse", session_id: session, cwd, ...call }, stateDir)?.hookSpecificOutput;
+	if (out?.permissionDecision === "deny" && out.permissionDecisionReason) return { block: out.permissionDecisionReason };
+	const command = out?.updatedInput?.command;
+	return command ? { command } : null;
 }
 
 function bin(): string | null {
@@ -40,21 +75,6 @@ function kick(args: string[], cwd: string): ChildProcess | null {
 	});
 	child.unref();
 	return child;
-}
-
-export function identifierFromRg(command: string): string | null {
-	// rg/grep/ag of a single argv token that looks like a symbol, no -e/-i/-P/-F flags
-	// that imply string/regex search. Path args after `--` are fine.
-	const trimmed = command.trim();
-	const m = trimmed.match(/^(?:rg|grep|ag|ugrep)\s+(.+)$/);
-	if (!m) return null;
-	const rest = m[1];
-	if (/(^|\s)-(e|i|P|F|R|w)\b/.test(rest)) return null;
-	const tokens = rest.split(/\s+/).filter((t) => t && t !== "--");
-	const positional = tokens.filter((t) => !t.startsWith("-"));
-	if (positional.length !== 1) return null;
-	const q = positional[0].replace(/^['"]|['"]$/g, "");
-	return isSymbolIdent(q) ? q : null;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -80,21 +100,11 @@ export default function (pi: ExtensionAPI) {
 		watch = null;
 	});
 
-	pi.on("tool_call", (event) => {
+	pi.on("tool_call", (event, ctx) => {
 		const input = event.input as Record<string, unknown>;
-		if (event.toolName === "grep") {
-			const pattern = String(input.pattern ?? "");
-			if (input.ignoreCase) return;
-			if (!isSymbolIdent(pattern)) return;
-			return {
-				block: true,
-				reason: `codescratch: use \`codescratch explore ${pattern}\` (or \`search ${pattern}\`) instead of grep for a symbol. grep is for strings/regex/TODO.`,
-			};
-		}
-		if (event.toolName === "bash") {
-			const q = identifierFromRg(String(input.command ?? ""));
-			if (!q) return;
-			input.command = `codescratch explore ${q}`;
-		}
+		const got = decide(event.toolName, input, ctx.cwd, ctx.sessionManager.getSessionId());
+		if (!got) return;
+		if ("block" in got) return { block: true, reason: got.block };
+		input.command = got.command;
 	});
 }

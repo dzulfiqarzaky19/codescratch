@@ -81,13 +81,20 @@ fn write_pi_extension() -> Result<Vec<PathBuf>> {
     if !dir.exists() && !home().join(".pi").join("agent").exists() {
         return Ok(vec![]);
     }
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("codescratch.ts");
+    // A directory extension: Pi loads `index.ts`, which loads the Claude host beside it for
+    // the grep rules.
+    let ext = dir.join("codescratch");
+    std::fs::create_dir_all(&ext)?;
+    let path = ext.join("index.ts");
     std::fs::write(&path, PI_EXT)?;
+    let engine = ext.join("claude-codescratch.cjs");
+    std::fs::write(&engine, CLAUDE_HOOK)?;
+    // the single-file extension this replaces: left in place, Pi would load both
+    let _ = std::fs::remove_file(dir.join("codescratch.ts"));
     // drop the old PostToolUse-only ensure hook if it is still sitting there
     let _ = std::fs::remove_file(dir.join("codescratch-ensure.ts"));
     let _ = std::fs::remove_file(dir.join("codescratch-ensure.ts.disabled"));
-    Ok(vec![path])
+    Ok(vec![path, engine])
 }
 
 fn write_claude_hook() -> Result<Vec<PathBuf>> {

@@ -208,4 +208,7 @@ pass "fold groups large grep results, passes small ones through, exits 1 on none
 node "$here/claude-hook.mjs" "$BIN" >/dev/null || fail "claude host hook regression" "run tests/claude-hook.mjs"
 pass "claude host answers symbol greps, leaves the rest"
 
+node --experimental-strip-types "$here/pi-rewrite.mjs" "$BIN" >/dev/null 2>&1 || fail "pi host regression" "run tests/pi-rewrite.mjs"
+pass "pi host takes the same answers from the claude host"
+
 echo "GOLDEN OK"

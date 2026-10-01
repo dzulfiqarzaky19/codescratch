@@ -17,6 +17,9 @@
  * A scope is the nearest ancestor holding `.codescratch/`, or the unique parent of a
  * registered group (the CLI fans out from there). Outside a scope the hook is silent.
  *
+ * host/pi-codescratch.ts loads this file and calls `decide` for the same answers: the rules
+ * below live here once.
+ *
  * Every decision lands in the context-economy ledger (`type: 'guard'`,
  * `hook: 'codescratch-host'`) so the scoreboard can net its cost against its value.
  * Never throws, always exits 0.
@@ -134,8 +137,11 @@ function metric(row) {
 
 // --- per-session state: which scopes were announced, which symbols were served ---
 
+/** Set for the length of a `decide` call: another host's state lives apart from the hook's. */
+let stateRoot = null;
+
 function statePath(session) {
-  const root = process.env.CLAUDE_HOOKS_STATE_DIR || path.join(os.homedir(), ".claude", "hooks", "state");
+  const root = stateRoot || process.env.CLAUDE_HOOKS_STATE_DIR || path.join(os.homedir(), ".claude", "hooks", "state");
   const safe = String(session || "nosession").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
   return path.join(root, HOOK, `${safe}.json`);
 }
@@ -495,8 +501,11 @@ function explore(ident, scope) {
 
 // --- events ---
 
+/** Where an event's answer goes: stdout for the hook process, the caller for `decide`. */
+let sink = (obj) => process.stdout.write(JSON.stringify(obj));
+
 function emit(obj) {
-  process.stdout.write(JSON.stringify(obj));
+  sink(obj);
 }
 
 function onSessionStart(input) {
@@ -688,6 +697,13 @@ function onPostToolUse(input) {
   if (root) kick(["ensure"], root);
 }
 
+function dispatch(input) {
+  const ev = input.hook_event_name;
+  if (ev === "SessionStart") onSessionStart(input);
+  else if (ev === "PreToolUse") onPreToolUse(input);
+  else if (ev === "PostToolUse") onPostToolUse(input);
+}
+
 function main() {
   let input = {};
   try {
@@ -695,10 +711,26 @@ function main() {
   } catch {
     return;
   }
-  const ev = input.hook_event_name;
-  if (ev === "SessionStart") onSessionStart(input);
-  else if (ev === "PreToolUse") onPreToolUse(input);
-  else if (ev === "PostToolUse") onPostToolUse(input);
+  dispatch(input);
+}
+
+/** One hook event → the answer the hook would print, or null: for a host that loads this file
+ *  instead of running it. `stateDir` holds that host's session state and fold logs. Never throws. */
+function decide(input, stateDir) {
+  const was = [sink, stateRoot];
+  let out = null;
+  sink = (obj) => {
+    out = obj;
+  };
+  stateRoot = stateDir || null;
+  try {
+    dispatch(input);
+  } catch {
+    out = null;
+  } finally {
+    [sink, stateRoot] = was;
+  }
+  return out;
 }
 
 if (require.main === module) {
@@ -710,4 +742,4 @@ if (require.main === module) {
   process.exit(0);
 }
 
-module.exports = { fromBash, fromGrepTool, scopeOf, isSymbolIdent, symbolsOf, splitChain, planBash, foldable };
+module.exports = { fromBash, fromGrepTool, scopeOf, isSymbolIdent, symbolsOf, splitChain, planBash, foldable, decide };
