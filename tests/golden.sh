@@ -188,6 +188,23 @@ fresh="$("$BIN" status "$tmp")"
 echo "$fresh" | grep -q "trust: fresh" || fail "ensure did not clear HEAD-drift stale" "$fresh"
 pass "ensure clears trust:stale after empty commit"
 
+# 13. fold: a large grep result is grouped under its enclosing symbol; small and empty ones are not
+{
+  echo 'export function many(): number {'
+  for i in $(seq 1 30); do echo "  const foldTarget$i = $i; // filler so the raw result is large"; done
+  echo '  return 0;'
+  echo '}'
+} > "$tmp/src/many.ts"
+"$BIN" ensure "$tmp" >/dev/null
+big="$(cd "$tmp" && grep -rn foldTarget src | "$BIN" fold)"
+echo "$big" | grep -q "1-33 function many ×30 L2,3,4,5,6,7,…: const foldTarget1 = 1;" || fail "fold did not group by symbol" "$big"
+small="$(cd "$tmp" && grep -rn foldTarget30 src | "$BIN" fold)"
+[ "$small" = "$(cd "$tmp" && grep -rn foldTarget30 src)" ] || fail "fold changed a small result" "$small"
+if (cd "$tmp" && grep -rn noSuchFoldTarget src | "$BIN" fold >/dev/null); then
+  fail "fold of an empty result should exit 1" ""
+fi
+pass "fold groups large grep results, passes small ones through, exits 1 on none"
+
 node "$here/claude-hook.mjs" "$BIN" >/dev/null || fail "claude host hook regression" "run tests/claude-hook.mjs"
 pass "claude host answers symbol greps, leaves the rest"
 

@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(here, "..", "host", "claude-codescratch.cjs");
 const BIN = path.resolve(process.argv[2] || path.join(here, "..", "target", "debug", "codescratch"));
-const { fromBash, fromGrepTool, splitChain, planBash } = createRequire(import.meta.url)(HOOK);
+const { fromBash, fromGrepTool, splitChain, planBash, foldable } = createRequire(import.meta.url)(HOOK);
 
 let failed = 0;
 const check = (label, ok) => {
@@ -87,7 +87,18 @@ const plans = {
   "rg -l Foo src | grep -v test | sort -u | head": { idents: ["Foo"], only: true },
   "rg Foo src | sort -k2": null,
   "rg Foo src | grep import": null,
-  "rg Foo src | wc -l": null,
+  "rg Foo src | wc -l": { idents: ["Foo"], only: true },
+  "grep -rn Foo src | cut -c1-170": { idents: ["Foo"], only: true },
+  "grep -rn Foo src 2>/dev/null | cut -c1-170 | head -12": { idents: ["Foo"], only: true },
+  "grep -rln Foo src | cut -d':' -f1 | sort -u | wc -l": { idents: ["Foo"], only: true },
+  // what reads on from the grep stays raw: a file, a positive filter, another program, another ref
+  "rg Foo src > /tmp/out.txt": null,
+  "rg Foo src | cut -c1-170 > /tmp/out.txt": null,
+  "rg Foo src | wc -c": null,
+  "rg Foo src | awk '{print $1}'": null,
+  "rg Foo src | sed -n 1,5p": null,
+  "git grep -n Foo origin/main -- src | cut -c1-170": null,
+  "git show origin/main:src/a.ts | grep -n Foo": null,
   "grep -rn 'Foo\\|Bar' src; ls": { idents: ["Foo|Bar"], only: false },
   // a grep inside a substitution or a heredoc body is never a segment of its own
   "echo $(rg Foo)": null,
@@ -109,6 +120,38 @@ for (const [cmd, want] of Object.entries(plans)) {
 check("plan tracks cd", planBash("cd /x; rg Foo sub; ls", "/r").hits[0].dir === "/x/sub");
 check("plan expands a literal variable", planBash('d="src/a b"; rg Foo "$d"', "/r").hits[0].dir === "/r/src/a b");
 
+// --- text fold: a grep for matching lines, optionally cut by head / cut -c ---
+const folds = {
+  "rg -n Foo src": ["rg -n Foo src", ""],
+  "grep -rn 'a|b' src 2>/dev/null | head -20": ["grep -rn 'a|b' src 2>/dev/null", "| head -20"],
+  'grep -rn "x > y (z)" src | cut -c1-170 | head': ['grep -rn "x > y (z)" src', "| cut -c1-170 | head"],
+  "rg -n Foo $DIR": ["rg -n Foo $DIR", ""],
+  "rg -n 'cost$' src": ["rg -n 'cost$' src", ""],
+  // output that is not matching lines
+  "rg -l Foo src": null,
+  "grep -rc Foo src": null,
+  "rg -on 'a.b' src": null,
+  "grep -rn -A2 Foo src": null,
+  "rg -C3 Foo": null,
+  "rg --json Foo": null,
+  "rg -n Foo -r Bar": null,
+  // another reader, a file, a substitution, another program
+  "rg Foo src | wc -l": null,
+  "rg Foo src | grep import": null,
+  "rg Foo src | cut -d: -f1": null,
+  "rg Foo src | sort": null,
+  "rg Foo src > out.txt": null,
+  "rg Foo src | head > out.txt": null,
+  "rg Foo $(cat list)": null,
+  "git grep -n Foo": null,
+  "cat a | grep Foo": null,
+};
+for (const [cmd, want] of Object.entries(folds)) {
+  const got = foldable(cmd);
+  check(`fold ${JSON.stringify(cmd)} => ${JSON.stringify(got)}`, JSON.stringify(got && [got.head, got.tail]) === JSON.stringify(want));
+}
+check("no fold outside a scope", planBash("rg -n 'a.b' src", "/r") === null);
+
 // --- end to end on a fixture repo ---
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cs-hook-"));
 const repo = path.join(tmp, "repo");
@@ -119,6 +162,11 @@ fs.mkdirSync(path.join(repo, "lib"));
 fs.writeFileSync(path.join(repo, "src", "a.ts"), "export interface Pet { name: string }\nexport function helper() { return 1; }\nexport function run() { return helper(); }\nconst label = 1;\n");
 // `label` is a word far more than it is a symbol: 13 files use it as a field.
 for (let i = 0; i < 13; i++) fs.writeFileSync(path.join(repo, "lib", `w${i}.ts`), `export const w${i} = { label: ${i} };\n`);
+// One function holding 30 lines of the same word: a grep result worth folding.
+fs.writeFileSync(
+  path.join(repo, "src", "big.ts"),
+  `export function big() {\n${Array.from({ length: 30 }, (_, i) => `  const needleWord${i} = ${i}; // padding padding`).join("\n")}\n}\n`,
+);
 fs.writeFileSync(path.join(plain, "a.ts"), "export function helper() { return 1; }\n");
 spawnSync(BIN, ["ensure"], { cwd: repo });
 
@@ -161,10 +209,10 @@ const sh = (command, session) =>
   run({ hook_event_name: "PreToolUse", session_id: session, cwd: repo, tool_name: "Bash", tool_input: { command, description: "d" } });
 const lone = sh("grep -rn helper src 2>/dev/null | grep -v test | head -20", "s4");
 check("bash lone grep denies", lone?.hookSpecificOutput?.permissionDecision === "deny");
-check("file-scoped grep runs", sh("grep -n helper src/a.ts; ls", "s4") === null);
+check("file-scoped grep is not denied", sh("grep -n helper src/a.ts; ls", "s4")?.hookSpecificOutput?.permissionDecision === undefined);
 check("several directories of one repo deny", sh("grep -rn helper src lib", "s7")?.hookSpecificOutput?.permissionDecision === "deny");
 check("a guessed directory that is absent is ignored", sh("grep -rn helper src app 2>/dev/null", "s9")?.hookSpecificOutput?.permissionDecision === "deny");
-check("a file among the paths runs", sh("grep -rn helper src/a.ts lib", "s8") === null);
+check("a file among the paths is not denied", sh("grep -rn helper src/a.ts lib", "s8")?.hookSpecificOutput?.permissionDecision === undefined);
 
 // Bash batch: only the hit segment is rewritten, the rest runs, and no decision is taken.
 const batch = `echo BEFORE; rg -n "helper\\(" src | head -3 && rg -n nothingHere src; echo AFTER`;
@@ -172,12 +220,42 @@ const rw = sh(batch, "s5")?.hookSpecificOutput;
 check("batch takes no permission decision", rw && rw.permissionDecision === undefined);
 check("batch keeps other tool_input fields", rw?.updatedInput?.description === "d");
 const cmd = rw?.updatedInput?.command || "";
-check("batch rewrites the hit segment", /^echo BEFORE; cat '[^']+' && rg -n nothingHere src; echo AFTER$/.test(cmd));
+check("batch rewrites the hit segment, folds the other grep", /^echo BEFORE; cat '[^']+' && rg -n nothingHere src \| '[^']+' fold --tag [0-9a-f]{12} --log '[^']+'; echo AFTER$/.test(cmd));
 check("answer file sits in the repo's .codescratch", cmd.includes(`cat '${path.join(repo, ".codescratch", "answers")}`));
 const ran = spawnSync("bash", ["-c", cmd], { cwd: repo, encoding: "utf8" });
 check("rewritten batch runs the answer and the rest", /BEFORE[\s\S]*answered from the graph[\s\S]*## [\s\S]*helper[\s\S]*AFTER/.test(ran.stdout));
-check("repeat batch runs raw", sh(batch, "s5") === null);
-check("batch with only misses untouched", sh("rg nothingHere src; ls", "s5") === null);
+const again = sh(batch, "s5")?.hookSpecificOutput?.updatedInput?.command || "";
+check("repeat batch runs the symbol grep raw", again.startsWith(`echo BEFORE; rg -n "helper\\(" src | head -3 && rg -n nothingHere src | '`));
+check("Grep tool is never folded", grep(repo, "needleWord\\d+", "f0") === null);
+
+// Text fold: the grep runs, `codescratch fold` reads it.
+const exec = (command) => spawnSync("bash", ["-c", command], { cwd: repo, encoding: "utf8" });
+const big = "grep -rn 'needleWord[0-9]' src 2>/dev/null | head -50";
+const f1 = sh(big, "f1")?.hookSpecificOutput;
+const f1cmd = f1?.updatedInput?.command || "";
+check("fold takes no permission decision", f1 && f1.permissionDecision === undefined);
+check("fold sits between the grep and its head", /^grep -rn 'needleWord\[0-9\]' src 2>\/dev\/null \| '[^']+' fold --tag [0-9a-f]{12} --log '[^']+' \| head -50$/.test(f1cmd));
+const f1out = exec(f1cmd).stdout;
+check("large result comes back grouped", /^fold: 30 hits in 1 files/.test(f1out) && /1-32 function big ×30 L2,/.test(f1out) && f1out.length < exec(big).stdout.length);
+check("repeat of a folded grep runs raw", sh(big, "f1") === null);
+check("the run after the raw one folds again", sh(big, "f1")?.hookSpecificOutput?.updatedInput?.command === f1cmd);
+// A symbol the graph cannot answer for falls through to the fold; 13 one-hit files do not shrink.
+const lab = sh("grep -rn label lib", "f2")?.hookSpecificOutput?.updatedInput?.command || "";
+check("unanswered symbol grep is folded", / fold --tag /.test(lab));
+check("a result folding would not shrink is unchanged", exec(lab).stdout === exec("grep -rn label lib").stdout && exec(lab).stdout.length > 500);
+check("a grep that was not folded is not a repeat", sh("grep -rn label lib", "f2")?.hookSpecificOutput?.updatedInput?.command === lab);
+const none = sh("grep -rn nothingHere src && echo FOUND; echo AFTER", "f3")?.hookSpecificOutput?.updatedInput?.command || "";
+check("no match still fails the chain", exec(none).stdout === "AFTER\n");
+// A binary without `fold` would swallow the grep's output: such a grep is left alone.
+const old = path.join(tmp, "old-bin");
+fs.writeFileSync(old, "#!/bin/sh\nexit 2\n", { mode: 0o755 });
+const stale = spawnSync("node", [HOOK], {
+  input: JSON.stringify({ hook_event_name: "PreToolUse", session_id: "f5", cwd: repo, tool_name: "Bash", tool_input: { command: big } }),
+  env: { ...env, CODESCRATCH_BIN: old },
+  encoding: "utf8",
+});
+check("binary without fold leaves the grep alone", stale.status === 0 && stale.stdout === "");
+check("a repeat of a symbol answer is raw, not folded", sh("grep -rn helper src", "f4")?.hookSpecificOutput?.permissionDecision === "deny" && sh("grep -rn helper src", "f4") === null);
 
 fs.rmSync(tmp, { recursive: true, force: true });
 if (failed) process.exit(1);

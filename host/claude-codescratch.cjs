@@ -9,6 +9,9 @@
  *                           hit inside a batch (`;` `&&` `||`) = that segment rewritten to a
  *                                  `cat` of the answer, the rest runs (updatedInput, no decision)
  *                           miss = grep runs untouched; a repeat of a served grep runs untouched
+ *                           any other grep for matching lines gets `| codescratch fold` appended:
+ *                                  a large result comes back grouped by enclosing symbol, a small
+ *                                  one unchanged; a repeat of a folded grep runs raw
  * PostToolUse Edit|Write  → ensure for the edited file's repo (host lock coalesces bursts)
  *
  * A scope is the nearest ancestor holding `.codescratch/`, or the unique parent of a
@@ -19,6 +22,7 @@
  * Never throws, always exits 0.
  */
 
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -139,7 +143,7 @@ function statePath(session) {
 function loadState(session) {
   try {
     const s = JSON.parse(fs.readFileSync(statePath(session), "utf8"));
-    return { scopes: s.scopes || [], served: s.served || {} };
+    return { scopes: s.scopes || [], served: s.served || {}, fold: s.fold };
   } catch {
     return { scopes: [], served: {} };
   }
@@ -157,10 +161,8 @@ function saveState(session, st) {
 
 function note(scope) {
   return (
-    `codescratch graph active for \`${path.basename(scope)}\`. For where-defined / who-calls / blast radius ` +
-    "use `codescratch explore <Symbol>` or `codescratch search <name>`; grep stays right for strings, regex, " +
-    "fields, SQL and config. A grep for symbol names is answered from the graph automatically; repeat the same " +
-    "grep once to force raw matches. Read the `trust:` line: under `coverage: sampled` or `resolve: partial`, absence is not proof."
+    `codescratch graph active for \`${path.basename(scope)}\`: greps are answered from the graph or folded by ` +
+    "symbol when large; repeat a grep once for raw lines."
   );
 }
 
@@ -266,10 +268,10 @@ function fromBash(command, cwd, vars) {
 }
 
 /** Output trims the graph answer makes moot: `| head -N`, `| tail -N`, `| sort`, `| uniq`,
- *  `2>/dev/null`, `2>&1`, and `| grep -v X` (the answer lists every caller; dropping some is
- *  the reader's call). */
+ *  `| cut ARGS`, `| wc -l`, `2>/dev/null`, `2>&1`, and `| grep -v X` (the answer lists every
+ *  caller; dropping some is the reader's call). */
 const TRIM_TAIL =
-  /(?:\s*\|\s*(?:head|tail)(?:\s+-n)?(?:\s+-?\d+)?|\s*\|\s*(?:sort(?:\s+-u)?|uniq)(?=\s*(?:\||$))|\s*\|\s*(?:grep|rg)\s+-[a-zA-Z]*v[a-zA-Z]*\s+(?:"[^"$`]*"|'[^']*'|[^\s|;&<>()$`'"]+)|\s+2>\s*\/dev\/null|\s+2>&1)+\s*$/;
+  /(?:\s*\|\s*(?:head|tail)(?:\s+-n)?(?:\s+-?\d+)?|\s*\|\s*(?:sort(?:\s+-u)?|uniq)(?=\s*(?:\||$))|\s*\|\s*cut(?:\s+(?:[^\s|;&<>()$`'"]|"[^"$`]*"|'[^']*')+)+|\s*\|\s*wc\s+-l(?![^\s|])|\s*\|\s*(?:grep|rg)\s+-[a-zA-Z]*v[a-zA-Z]*\s+(?:"[^"$`]*"|'[^']*'|[^\s|;&<>()$`'"]+)|\s+2>\s*\/dev\/null|\s+2>&1)+\s*$/;
 /** Explore calls one hook run may spend (3s timeout each). */
 const MAX_REWRITES = 4;
 
@@ -361,8 +363,9 @@ function splitChain(command) {
   return parts;
 }
 
-/** Bash command → { parts, hits: [{ i, idents, dir }], only } or null. `only`: nothing but
- *  `cd`s and one symbol grep, so the whole call can be answered; otherwise segments are rewritten. */
+/** Bash command → { parts, hits: [{ i, idents, dir }], folds: [{ i, dir, head, tail }], only }
+ *  or null. `only`: nothing but `cd`s and one symbol grep, so the whole call can be answered;
+ *  otherwise segments are rewritten. `folds`: segments whose output `codescratch fold` can read. */
 function planBash(command, cwd) {
   const parts = splitChain(command);
   if (!parts) return null;
@@ -372,6 +375,7 @@ function planBash(command, cwd) {
   const vars = new Map();
   let others = 0;
   const hits = [];
+  const folds = [];
   parts.forEach((p, i) => {
     const t = p.text.trim();
     if (!t) return;
@@ -393,9 +397,90 @@ function planBash(command, cwd) {
     const target = dir && fromBash(t.replace(TRIM_TAIL, ""), dir, vars);
     if (target) hits.push({ i, ...target });
     else others++;
+    const fold = dir && scopeOf(dir) && foldable(t);
+    if (fold) folds.push({ i, dir, ...fold });
   });
-  if (!hits.length) return null;
-  return { parts, hits, only: others === 0 && hits.length === 1 };
+  if (!hits.length && !folds.length) return null;
+  return { parts, hits, folds, only: others === 0 && hits.length === 1 };
+}
+
+// --- text fold: every other grep still runs, and `codescratch fold` reads its output ---
+
+/** Flags whose output is not a list of matching lines (file names, counts, context, the matched
+ *  part alone): nothing to group. */
+const FOLD_SKIP_SHORT = /^-[a-zA-Z]*[olLcqABCz]/;
+const FOLD_SKIP_LONG =
+  /^--(?:only-matching|files-with(?:out)?-match(?:es)?|count(?:-matches)?|quiet|json|files|replace|(?:after-|before-)?context|null(?:-data)?|passthru|stats|no-filename)(?:=|$)/;
+/** What may read on from a folded result: a row limit, a width limit. */
+const FOLD_TAIL = /^(?:\s*\|\s*(?:head(?:\s+-n)?(?:\s+-?\d+)?|cut\s+-c\s*[\d,-]+)(?=\s*(?:\||$)))*\s*$/;
+const ERR_TAIL = /(?:\s+2>\s*\/dev\/null|\s+2>&1)+\s*$/;
+
+/** `s` with every quoted span and escaped character blanked, length kept: what is left is
+ *  what the shell reads as syntax. null when a quote never closes. */
+function unquoted(s) {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    let end = i + 1;
+    if (ch === "\\") end = Math.min(i + 2, s.length);
+    else if (ch === "'" || ch === '"') end = skipBalanced(s, i);
+    else {
+      out += ch;
+      continue;
+    }
+    if (end < 0) return null;
+    out += " ".repeat(end - i);
+    i = end - 1;
+  }
+  return out;
+}
+
+/** One segment → { head, tail } when it is `rg|grep ARGS [| head] [| cut -c]` printing matching
+ *  lines: `head | codescratch fold tail` then prints the same thing, or less. Deliberately loose
+ *  about ARGS (variables, paths, globs stay the shell's business): `fold` passes through
+ *  whatever does not arrive as `path:line:text`. Redirects, substitutions and any other reader
+ *  of the output: never. */
+function foldable(t) {
+  const u = unquoted(t);
+  if (u === null) return null;
+  const bar = u.indexOf("|");
+  const cut = bar < 0 ? t.length : bar;
+  const args = u.slice(0, cut).replace(ERR_TAIL, "");
+  const prog = /^(rg|grep|ugrep)\s/.exec(args);
+  if (!prog || /[<>`()]/.test(args) || !FOLD_TAIL.test(t.slice(cut))) return null;
+  for (const w of args.split(/\s+/).slice(1)) {
+    if (w === "--") break;
+    if (FOLD_SKIP_LONG.test(w) || FOLD_SKIP_SHORT.test(w)) return null;
+    // rg's `-r` rewrites the match; grep's recurses.
+    if (prog[1] === "rg" && /^-[a-zA-Z]*r/.test(w)) return null;
+  }
+  return { head: t.slice(0, cut).trimEnd(), tail: t.slice(cut) };
+}
+
+/** Whether the installed binary has `fold`, asked once per session: piping a grep into a
+ *  binary without it would lose the grep's output. */
+function canFold(st) {
+  if (st.fold === undefined) st.fold = spawnSync(bin(), ["fold", "--help"], { timeout: 3000 }).status === 0;
+  return st.fold;
+}
+
+function foldLog(session) {
+  return statePath(session).replace(/\.json$/, ".fold.jsonl");
+}
+
+/** Latest log line for `tag`: written by `codescratch fold`, or by this hook for a raw rerun. */
+function lastFold(log, tag) {
+  try {
+    const lines = fs.readFileSync(log, "utf8").split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].includes(tag)) continue;
+      const row = JSON.parse(lines[i]);
+      if (row.tag === tag) return row;
+    }
+  } catch {
+    /* no log yet */
+  }
+  return null;
 }
 
 /** `explore --brief` for one name → { body } when the graph stands in for the grep (brief
@@ -427,8 +512,9 @@ function onSessionStart(input) {
 
 /** One symbol grep → { key, ident, repo, root, body }, or null when the grep should run (a file
  *  path, outside a scope, a repeat, a name the graph cannot answer). `ident` is every name
- *  looked up, joined. Pushes the first-touch note for a repo the session did not start in. */
-function answerFor(target, st, session, notes) {
+ *  looked up, joined. Fills `aside`: `notes` gets the first-touch note for a repo the session
+ *  did not start in, `raw` the segment of a repeat (it asked for raw lines: no fold either). */
+function answerFor(target, st, session, aside) {
   // A grep scoped to one file wants that file's lines, not the repo-wide graph answer.
   if (!isDir(target.dir)) return null;
   const scope = scopeOf(target.dir);
@@ -437,7 +523,7 @@ function answerFor(target, st, session, notes) {
     // First touch of a repo the session did not start in: catch it up and say so once.
     st.scopes.push(scope);
     kick(["ensure"], scope);
-    notes.push(note(scope));
+    aside.notes.push(note(scope));
   }
   const ident = target.idents.join("|");
   const key = `${scope}\0${ident}`;
@@ -445,6 +531,7 @@ function answerFor(target, st, session, notes) {
   if (st.served[key]) {
     // Escape hatch: Claude asked twice, so it wants raw matches. Log it as waste.
     metric({ decision: "allow", rule: "regrep", ident, repo, session });
+    aside.raw.add(target.i);
     return null;
   }
   const bodies = [];
@@ -467,18 +554,22 @@ function answerFor(target, st, session, notes) {
   return { key, ident, names: target.idents, repo, root: findRoot(target.dir), body };
 }
 
+const newAside = () => ({ notes: [], raw: new Set() });
+
 function contextOnly(notes) {
   if (notes.length) emit({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: notes.join("\n") } });
 }
 
-/** The whole call is one symbol grep: deny it and hand back the answer (no extra turn). */
+/** The whole call is one symbol grep: deny it and hand back the answer (no extra turn).
+ *  Returns null once denied, else what `answerFor` set aside: the grep is going to run. */
 function serveDeny(input, target) {
   const st = loadState(input.session_id);
-  const notes = [];
-  const a = answerFor(target, st, input.session_id, notes);
+  const aside = newAside();
+  const { notes } = aside;
+  const a = answerFor(target, st, input.session_id, aside);
   if (a) st.served[a.key] = true;
   saveState(input.session_id, st);
-  if (!a) return contextOnly(notes);
+  if (!a) return aside;
   metric({ decision: "deny", rule: "symbol-served", ident: a.ident, repo: a.repo, session: input.session_id, explore_chars: a.body.length });
   const out = {
     hookSpecificOutput: {
@@ -491,6 +582,7 @@ function serveDeny(input, target) {
   };
   if (notes.length) out.hookSpecificOutput.additionalContext = notes.join("\n");
   emit(out);
+  return null;
 }
 
 /** Answers live in the grepped repo's own `.codescratch/`, so reading one needs exactly the
@@ -515,18 +607,19 @@ function answerFile(session, a) {
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
 /** Symbol greps inside a batch: swap each answered segment for a `cat` of its answer and let
- *  the rest run. No permissionDecision, so the rewritten command goes through the normal
- *  permission flow (verified on CC 2.1.282: an allow rule for the original did not cover it). */
-function serveRewrite(input, plan) {
+ *  the rest run; every other foldable grep gets `| codescratch fold`. No permissionDecision, so
+ *  the rewritten command goes through the normal permission flow (verified on CC 2.1.282: an
+ *  allow rule for the original did not cover it). */
+function serveRewrite(input, plan, aside = newAside()) {
   const st = loadState(input.session_id);
-  const notes = [];
+  const { notes } = aside;
   const texts = plan.parts.map((p) => p.text);
   const local = new Map();
   const served = [];
   for (const h of plan.hits.slice(0, MAX_REWRITES)) {
     const k = `${h.dir}\0${h.idents.join("|")}`;
     if (!local.has(k)) {
-      const a = answerFor(h, st, input.session_id, notes);
+      const a = answerFor(h, st, input.session_id, aside);
       const file = a && answerFile(input.session_id, a);
       local.set(k, file ? { ...a, file } : null);
       if (file) {
@@ -535,10 +628,33 @@ function serveRewrite(input, plan) {
       }
     }
     const got = local.get(k);
-    if (got) texts[h.i] = texts[h.i].replace(texts[h.i].trim(), `cat ${shq(got.file)}`);
+    if (got) texts[h.i] = texts[h.i].replace(texts[h.i].trim(), () => `cat ${shq(got.file)}`);
+  }
+  const log = foldLog(input.session_id);
+  let folded = 0;
+  for (const f of plan.folds.length && canFold(st) ? plan.folds : []) {
+    // Answered from the graph just above, or a repeat asking for the raw lines.
+    if (texts[f.i] !== plan.parts[f.i].text || aside.raw.has(f.i)) continue;
+    const tag = crypto.createHash("sha1").update(`${f.dir}\0${f.head}`).digest("hex").slice(0, 12);
+    const repo = path.basename(scopeOf(f.dir));
+    try {
+      fs.mkdirSync(path.dirname(log), { recursive: true });
+      if (lastFold(log, tag)?.folded) {
+        // Escape hatch: the folded answer was not enough, so this run is raw. Logged, so the
+        // run after it folds again.
+        fs.appendFileSync(log, `${JSON.stringify({ ts: Date.now(), tag, regrep: true })}\n`);
+        metric({ decision: "allow", rule: "fold-regrep", repo, session: input.session_id });
+        continue;
+      }
+    } catch {
+      continue;
+    }
+    texts[f.i] = texts[f.i].replace(texts[f.i].trim(), () => `${f.head} | ${shq(bin())} fold --tag ${tag} --log ${shq(log)}${f.tail && ` ${f.tail}`}`);
+    metric({ decision: "rewrite", rule: "text-fold", repo, session: input.session_id });
+    folded++;
   }
   saveState(input.session_id, st);
-  if (!served.length) return contextOnly(notes);
+  if (!served.length && !folded) return contextOnly(notes);
   for (const a of served)
     metric({ decision: "rewrite", rule: "symbol-rewrite", ident: a.ident, repo: a.repo, session: input.session_id, explore_chars: a.body.length });
   const command = texts.map((t, i) => t + plan.parts[i].sep).join("");
@@ -552,14 +668,17 @@ function onPreToolUse(input) {
   const ti = input.tool_input || {};
   if (input.tool_name === "Grep") {
     const target = fromGrepTool(ti, cwd);
-    if (target) serveDeny(input, target);
+    const aside = target && serveDeny(input, target);
+    if (aside) contextOnly(aside.notes);
     return;
   }
   if (input.tool_name !== "Bash") return;
   const plan = planBash(ti.command || "", cwd);
   if (!plan) return;
-  if (plan.only) serveDeny(input, plan.hits[0]);
-  else serveRewrite(input, plan);
+  if (!plan.only) return serveRewrite(input, plan);
+  // The graph had no answer for the one symbol grep: it runs, folded if it can be.
+  const aside = serveDeny(input, plan.hits[0]);
+  if (aside) serveRewrite(input, { ...plan, hits: [] }, aside);
 }
 
 function onPostToolUse(input) {
@@ -591,4 +710,4 @@ if (require.main === module) {
   process.exit(0);
 }
 
-module.exports = { fromBash, fromGrepTool, scopeOf, isSymbolIdent, symbolsOf, splitChain, planBash };
+module.exports = { fromBash, fromGrepTool, scopeOf, isSymbolIdent, symbolsOf, splitChain, planBash, foldable };

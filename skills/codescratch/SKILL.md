@@ -1,28 +1,20 @@
 ---
 name: codescratch
-description: TS/JS structure graph. Prefer over grep/rg for where a symbol is defined, who calls it, or blast radius. CLI only — codescratch explore|search|status|changes.
+description: TS/JS symbol graph CLI — where a symbol is defined, who calls it, blast radius. codescratch explore|search|changes.
 ---
 
-Graph lives in `<repo>/.codescratch/graph.db`. Host keeps it fresh (`ensure` / `watch`). Do not reindex every turn.
-
-In Claude Code a grep for symbol names (`Foo`, `Foo(`, `export const Foo`, `Foo\|Bar`) inside a codescratch repo is answered from the graph when it can account for every file that mentions them: a lone grep is denied and the reason carries the `explore` answer; inside a batch (`;` `&&` `||`) that segment prints the answer instead and the rest runs. Use it. Repeat the same grep once only if you need raw text matches. A grep scoped to one file always runs.
-
 ```
-codescratch status                         # trust × coverage × resolve
-codescratch explore <Symbol>               # snippet + calls + callers (blast)
-codescratch explore <Symbol> --brief       # where defined + signature + callers + uses + text-only mentions, no source
+codescratch explore <Symbol> [--brief]     # source + calls + callers (blast); --brief: no source
 codescratch search <name>                  # fuzzy find
 codescratch changes                        # git diff → symbols + blast
-codescratch ensure                         # catch-up if banner says trust: stale
+codescratch status                         # trust × coverage × resolve
+codescratch ensure                         # only when the banner says trust: stale
 ```
 
-`--group NAME` fans out over that group's repos (each keeps its own db). Omit it: cwd is one repo, unless cwd is the unique parent of a registered group (e.g. `/kabana` → group `kabana`).
+`--group NAME` fans out over a group's repos; from the group's parent directory it is implied.
 
-Read the banner on every answer. Three axes, do not mix them:
-- `trust:` freshness only (`fresh` / `stale` / `rebuilding` / `missing`). `stale` = HEAD moved since last `ensure`. Run `ensure`. Never treat `resolve:` as stale.
-- `coverage:` how much was walked (`exhaustive` / `sampled`).
-- `resolve:` in-repo bind rate (`ok` / `partial`). Weak / unbound calls. Not freshness.
-`conf=weak` on an edge is a name guess. Auth/money/deletes: read source anyway. Graph misses `import()`, DI, proxies.
-`uses ←` lists non-call references (JSX elements, type annotations, values passed or read), resolved by import or same file only.
+In Claude Code the host does the routing: a grep for symbol names is answered from the graph, and any other large grep result comes back folded, one row per enclosing symbol:
+`  START-END kind name ×hits Lline,line: first hit` under its file path. Read that range, not the file. Repeat the same grep once for raw lines.
 
-Never `reindex` unless trust is stuck. `rg`/`grep` for a single identifier (`Foo`) is a miss — `explore Foo` first. Strings, regex, `TODO`, path filters: grep is fine.
+Banner, three separate axes: `trust:` freshness (`stale` → run `ensure`; never `reindex` unless stuck), `coverage:` how much was walked (`sampled`: absence is not proof), `resolve:` in-repo bind rate (`partial`: some calls unbound; not freshness).
+`conf=weak` is a name guess. Auth/money/deletes: read the source anyway. The graph misses `import()`, DI, proxies. `uses ←` lists non-call references (JSX, types, values).

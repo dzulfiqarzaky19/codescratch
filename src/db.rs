@@ -3,7 +3,7 @@
 //! honesty fields (`conf`, `reason`, `provenance`) present from day one.
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: &str = "2";
@@ -25,6 +25,18 @@ pub fn open(root: &Path) -> Result<Connection> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     migrate(&conn)?;
     Ok(conn)
+}
+
+pub fn exists(root: &Path) -> bool {
+    db_path(root).is_file()
+}
+
+/// An existing graph, opened without creating, migrating or writing anything.
+pub fn open_read(root: &Path) -> Result<Connection> {
+    Ok(Connection::open_with_flags(
+        db_path(root),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?)
 }
 
 fn migrate(conn: &Connection) -> Result<()> {

@@ -7,6 +7,7 @@ mod changes;
 mod db;
 mod embeddings;
 mod extract;
+mod fold;
 mod git;
 mod group;
 mod host;
@@ -92,6 +93,15 @@ enum Command {
         /// Search every repo in this group.
         #[arg(long)]
         group: Option<String>,
+    },
+    /// Grep output on stdin → hits grouped by enclosing symbol; small results pass through.
+    Fold {
+        /// Append one JSON line of sizes (raw vs printed) to this file.
+        #[arg(long, value_name = "FILE")]
+        log: Option<PathBuf>,
+        /// The caller's name for this search, copied into the log line.
+        #[arg(long)]
+        tag: Option<String>,
     },
     /// Write the global skill + Pi host extension; strip leftover MCP entries.
     Setup {
@@ -190,6 +200,11 @@ fn main() -> Result<()> {
                 "{}",
                 scope_of(group, pick_path(path_pos, path))?.search(&q)?
             );
+        }
+        Command::Fold { log, tag } => {
+            if !fold::run(log.as_deref(), tag.as_deref())? {
+                std::process::exit(1);
+            }
         }
         Command::Setup { path, group } => {
             let g = group::from_env(group.as_deref());
