@@ -603,6 +603,49 @@ function answerFor(target, st, session, aside) {
 
 const newAside = () => ({ notes: [], raw: new Set() });
 
+/** The Grep tool call as the `rg` it runs (Claude Code's Grep is ripgrep; files mode by default). */
+function grepToolCommand(t) {
+  const mode = t.output_mode === "content" ? "-n" : t.output_mode === "count" ? "-c" : "-l";
+  const opt = (flag, v) => (v ? ` ${flag} ${shq(String(v))}` : "");
+  const limit = Number(t.head_limit) > 0 ? ` | head -${Number(t.head_limit)}` : "";
+  return `rg ${mode} -e ${shq(String(t.pattern || ""))}${opt("-g", t.glob)}${opt("-t", t.type)}${t.path ? ` ${shq(String(t.path))}` : ""}${limit}`;
+}
+
+/** A replay of the grep an answer replaced reads files and prints, nothing else: a grep, then
+ *  only line filters. */
+const REPLAY_HEAD = /^(?:cd\s+\S+\s*&&\s*)?(?:rg|grep|ugrep)\s/;
+const REPLAY_PIPE = /^(?:grep|rg|head|cut|sort|uniq|wc)\b/;
+
+/** What an answer stood in for, measured when it is given, so the scoreboard can price it:
+ *  `grep_chars` = what the grep prints (null when it cannot be replayed safely), `body_chars` =
+ *  a Read of each answered symbol's lines, `def_files` = where those live (a Read of one right
+ *  after means the answer did not replace it). */
+function measureAnswer(a, raw, cwd) {
+  let grep_chars = null;
+  // stderr never reaches the count, so its redirects can go.
+  const cmd = String(raw || "").replace(/\s+2>(?:\s*\/dev\/null|&1)/g, "");
+  // Shell syntax is judged with quoted spans blanked, so a quoted `a|b` pattern is one word.
+  const u = unquoted(cmd);
+  const pipes = [];
+  for (let at = 0, i = 0; u !== null && i <= u.length; i++) if (i === u.length || u[i] === "|") pipes.push(cmd.slice(at, i).trim()), (at = i + 1);
+  if (u !== null && REPLAY_HEAD.test(pipes[0]) && pipes.slice(1).every((x) => REPLAY_PIPE.test(x)) && !/[<>;`]|\$\(|&&.*&&|\|\|/.test(u)) {
+    const r = spawnSync("bash", ["-c", cmd], { cwd, encoding: "utf8", timeout: 2000, maxBuffer: 16 << 20 });
+    if (!r.error && r.signal === null) grep_chars = (r.stdout || "").length;
+  }
+  let body_chars = 0;
+  const def_files = [];
+  for (const m of a.body.matchAll(/^## .*?\((\S+?):(\d+)-(\d+)\)/gm)) {
+    if (!def_files.includes(m[1])) def_files.push(m[1]);
+    try {
+      const lines = fs.readFileSync(path.join(a.root, m[1]), "utf8").split("\n").slice(+m[2] - 1, +m[3]);
+      body_chars += lines.reduce((t, l) => t + l.length + 8, 0); // Read prints `   N\t` per line
+    } catch {
+      /* moved since the graph was built */
+    }
+  }
+  return { grep_chars, body_chars, def_files };
+}
+
 function contextOnly(notes) {
   if (notes.length) emit({ hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: notes.join("\n") } });
 }
@@ -617,7 +660,8 @@ function serveDeny(input, target) {
   if (a) st.served[a.key] = true;
   saveState(input.session_id, st);
   if (!a) return aside;
-  metric({ decision: "deny", rule: "symbol-served", ident: a.ident, repo: a.repo, session: input.session_id, explore_chars: a.body.length });
+  const replay = input.tool_name === "Grep" ? grepToolCommand(input.tool_input) : input.tool_input.command;
+  metric({ decision: "deny", rule: "symbol-served", ident: a.ident, repo: a.repo, session: input.session_id, explore_chars: a.body.length, ...measureAnswer(a, replay, input.cwd) });
   const out = {
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
@@ -671,7 +715,7 @@ function serveRewrite(input, plan, aside = newAside()) {
       local.set(k, file ? { ...a, file } : null);
       if (file) {
         st.served[a.key] = true;
-        served.push(a);
+        served.push({ ...a, i: h.i });
       }
     }
     const got = local.get(k);
@@ -704,8 +748,10 @@ function serveRewrite(input, plan, aside = newAside()) {
   }
   saveState(input.session_id, st);
   if (!served.length && !folded) return contextOnly(notes);
-  for (const a of served)
-    metric({ decision: "rewrite", rule: "symbol-rewrite", ident: a.ident, repo: a.repo, session: input.session_id, explore_chars: a.body.length });
+  for (const a of served) {
+    const fold = plan.folds.find((f) => f.i === a.i);
+    metric({ decision: "rewrite", rule: "symbol-rewrite", ident: a.ident, repo: a.repo, session: input.session_id, explore_chars: a.body.length, ...measureAnswer(a, plan.parts[a.i].text, fold ? fold.dir : input.cwd) });
+  }
   const command = texts.map((t, i) => t + plan.parts[i].sep).join("");
   const out = { hookSpecificOutput: { hookEventName: "PreToolUse", updatedInput: { ...input.tool_input, command } } };
   if (notes.length) out.hookSpecificOutput.additionalContext = notes.join("\n");
@@ -782,4 +828,4 @@ if (require.main === module) {
   process.exit(0);
 }
 
-module.exports = { fromBash, fromGrepTool, scopeOf, isSymbolIdent, symbolsOf, splitChain, planBash, foldable, tailFlags, decide };
+module.exports = { fromBash, fromGrepTool, scopeOf, isSymbolIdent, symbolsOf, splitChain, planBash, foldable, tailFlags, measureAnswer, grepToolCommand, decide };

@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(here, "..", "host", "claude-codescratch.cjs");
 const BIN = path.resolve(process.argv[2] || path.join(here, "..", "target", "debug", "codescratch"));
-const { fromBash, fromGrepTool, splitChain, planBash, foldable, tailFlags } = createRequire(import.meta.url)(HOOK);
+const { fromBash, fromGrepTool, splitChain, planBash, foldable, tailFlags, measureAnswer } = createRequire(import.meta.url)(HOOK);
 
 let failed = 0;
 const check = (label, ok) => {
@@ -281,6 +281,10 @@ const smallcmd = sh(small, "f7")?.hookSpecificOutput?.updatedInput?.command || "
 check("small one-file grep prints exactly what grep prints", / --strip-path src\/a\.ts$/.test(smallcmd) && exec(smallcmd).stdout === exec(small).stdout);
 const none = sh("grep -rn nothingHere src && echo FOUND; echo AFTER", "f3")?.hookSpecificOutput?.updatedInput?.command || "";
 check("no match still fails the chain", exec(none).stdout === "AFTER\n");
+// What an answer replaced, measured for the scoreboard: the grep's own output, the symbol's lines.
+const ma = measureAnswer({ body: "## function `helper`  (src/a.ts:2-2)\n", root: repo }, "grep -rn 'helper\\|x' src 2>/dev/null | head -5", repo);
+check("measure: grep size and body read", ma.grep_chars === exec("grep -rn 'helper\\|x' src | head -5").stdout.length && ma.grep_chars > 0 && ma.body_chars === 46 && ma.def_files[0] === "src/a.ts");
+check("measure: a redirect is never replayed", measureAnswer({ body: "", root: repo }, "grep -rn helper src > o", repo).grep_chars === null);
 // A binary without `fold` would swallow the grep's output: such a grep is left alone.
 const old = path.join(tmp, "old-bin");
 fs.writeFileSync(old, "#!/bin/sh\nexit 2\n", { mode: 0o755 });
