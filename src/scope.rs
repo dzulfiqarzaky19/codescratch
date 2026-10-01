@@ -77,7 +77,7 @@ impl Scope {
         // Brief only: word matches in the repos that do not declare the symbol.
         let mut stray: Vec<String> = Vec::new();
         let (parts, _) = self.fold_group(|root, label, _t, _err| {
-            match query::explore_one(root, symbol) {
+            match query::explore_one(root, symbol, detail) {
                 Ok(Explored::Found(view)) => found.push((label.to_string(), view)),
                 Ok(Explored::Missing { .. }) => {
                     if detail == Detail::Brief {

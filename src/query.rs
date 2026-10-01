@@ -143,7 +143,7 @@ pub enum Explored {
 
 pub fn explore(root: &Path, symbol: &str, detail: Detail) -> Result<String> {
     let banner = trust::banner(&trust::of(root)?);
-    match explore_one(root, symbol)? {
+    match explore_one(root, symbol, detail)? {
         Explored::Found(view) => Ok(format!("{banner}\n\n{}", render_view(&view, detail))),
         Explored::Missing { suggestions } => {
             let mut out = format!(
@@ -162,7 +162,7 @@ pub fn explore(root: &Path, symbol: &str, detail: Detail) -> Result<String> {
 
 /// The explore payload for one repo, minus the banner. Returns [`Explored::Missing`]
 /// when no node carries that name — the single place found-vs-missing is decided.
-pub fn explore_one(root: &Path, symbol: &str) -> Result<Explored> {
+pub fn explore_one(root: &Path, symbol: &str, detail: Detail) -> Result<Explored> {
     let conn = db::open(root)?;
 
     let node = conn
@@ -186,13 +186,16 @@ pub fn explore_one(root: &Path, symbol: &str) -> Result<Explored> {
     };
 
     let mut view = gather(&conn, root, n);
-    if view.same_name > 1 && view.same_name <= MAX_SAME_NAME {
-        view.others = same_name_nodes(&conn, &view.node)
-            .into_iter()
-            .map(|o| gather(&conn, root, o))
-            .collect();
+    // Only brief prints the same-name nodes and the text scan; full skips the disk read.
+    if detail == Detail::Brief {
+        if view.same_name > 1 && view.same_name <= MAX_SAME_NAME {
+            view.others = same_name_nodes(&conn, &view.node)
+                .into_iter()
+                .map(|o| gather(&conn, root, o))
+                .collect();
+        }
+        view.text_only = text_only_mentions(&conn, root, &view.node.name);
     }
-    view.text_only = text_only_mentions(&conn, root, &view.node.name);
     Ok(Explored::Found(view))
 }
 
