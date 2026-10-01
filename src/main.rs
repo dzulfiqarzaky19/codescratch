@@ -102,6 +102,15 @@ enum Command {
         /// The caller's name for this search, copied into the log line.
         #[arg(long)]
         tag: Option<String>,
+        /// The caller added `-H` to a one-file grep: lines passed through lose this `FILE:` again.
+        #[arg(long, value_name = "FILE")]
+        strip_path: Option<String>,
+        /// The caller's pipe keeps only the first N lines (`| head -N`): sizes are compared there.
+        #[arg(long, value_name = "N")]
+        head: Option<usize>,
+        /// The caller's pipe keeps only these characters (`| cut -c LIST`).
+        #[arg(long, value_name = "LIST")]
+        cut: Option<String>,
     },
     /// Write the global skill + Pi host extension; strip leftover MCP entries.
     Setup {
@@ -201,8 +210,19 @@ fn main() -> Result<()> {
                 scope_of(group, pick_path(path_pos, path))?.search(&q)?
             );
         }
-        Command::Fold { log, tag } => {
-            if !fold::run(log.as_deref(), tag.as_deref())? {
+        Command::Fold {
+            log,
+            tag,
+            strip_path,
+            head,
+            cut,
+        } => {
+            let tail = fold::Tail {
+                head,
+                // An unreadable LIST compares uncut: failing here would swallow the grep's output.
+                cut: cut.as_deref().and_then(fold::Tail::parse_cut),
+            };
+            if !fold::run(log.as_deref(), tag.as_deref(), strip_path.as_deref(), &tail)? {
                 std::process::exit(1);
             }
         }

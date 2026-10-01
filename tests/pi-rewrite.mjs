@@ -58,7 +58,7 @@ check("bash: outside a scope runs", bash("rg -n needleWord src | head -50", "p4"
 
 const big = "rg -n needleWord src | head -50";
 const folded = bash(big, "p5")?.command || "";
-check("bash: any other grep is piped through fold", / fold --tag \w+ --log '.*' \| head -50$/.test(folded) && folded.includes(state));
+check("bash: any other grep is piped through fold", / fold --tag \w+ --log '.*' --head 50 \| head -50$/.test(folded) && folded.includes(state));
 const ran = spawnSync("sh", ["-c", folded], { cwd: repo, encoding: "utf8" });
 check("bash: the folded command prints a fold", /^fold: 30 hits/.test(ran.stdout));
 check("bash: a repeat of a folded grep runs raw", bash(big, "p5") === null);

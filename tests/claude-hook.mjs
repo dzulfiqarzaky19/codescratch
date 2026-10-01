@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(here, "..", "host", "claude-codescratch.cjs");
 const BIN = path.resolve(process.argv[2] || path.join(here, "..", "target", "debug", "codescratch"));
-const { fromBash, fromGrepTool, splitChain, planBash, foldable } = createRequire(import.meta.url)(HOOK);
+const { fromBash, fromGrepTool, splitChain, planBash, foldable, tailFlags } = createRequire(import.meta.url)(HOOK);
 
 let failed = 0;
 const check = (label, ok) => {
@@ -150,6 +150,28 @@ for (const [cmd, want] of Object.entries(folds)) {
   const got = foldable(cmd);
   check(`fold ${JSON.stringify(cmd)} => ${JSON.stringify(got)}`, JSON.stringify(got && [got.head, got.tail]) === JSON.stringify(want));
 }
+// One file: grep prints no path, so the hook adds `-H` and names the file for fold to strip.
+const files = {
+  "grep -nE 'a|b' $F | cut -c1-140 | head -40": "$F",
+  'grep -n "x y" src/a.ts': "src/a.ts",
+  "grep -n -e Foo src/a.ts 2>/dev/null": "src/a.ts",
+  "grep -rn Foo src": null,
+  "grep -n Foo src/a.ts src/b.ts": null,
+  "grep -n Foo src/*.ts": null,
+  "grep -n -m 5 Foo src/a.ts": null,
+  "rg -n Foo src/a.ts": null,
+};
+for (const [cmd, want] of Object.entries(files)) check(`fold file ${JSON.stringify(cmd)} => ${want}`, foldable(cmd)?.file === want);
+const tails = {
+  "": "",
+  "| head -30": " --head 30",
+  "| head": " --head 10",
+  "| head -n 40": " --head 40",
+  "| head -n -5": "",
+  "| cut -c1-150 | head -40": " --head 40 --cut 1-150",
+  "| head -50 | head -20": " --head 20",
+};
+for (const [tail, want] of Object.entries(tails)) check(`tail ${JSON.stringify(tail)} => ${JSON.stringify(want)}`, tailFlags(tail) === want);
 check("no fold outside a scope", planBash("rg -n 'a.b' src", "/r") === null);
 
 // --- end to end on a fixture repo ---
@@ -234,7 +256,7 @@ const big = "grep -rn 'needleWord[0-9]' src 2>/dev/null | head -50";
 const f1 = sh(big, "f1")?.hookSpecificOutput;
 const f1cmd = f1?.updatedInput?.command || "";
 check("fold takes no permission decision", f1 && f1.permissionDecision === undefined);
-check("fold sits between the grep and its head", /^grep -rn 'needleWord\[0-9\]' src 2>\/dev\/null \| '[^']+' fold --tag [0-9a-f]{12} --log '[^']+' \| head -50$/.test(f1cmd));
+check("fold sits between the grep and its head", /^grep -rn 'needleWord\[0-9\]' src 2>\/dev\/null \| '[^']+' fold --tag [0-9a-f]{12} --log '[^']+' --head 50 \| head -50$/.test(f1cmd));
 const f1out = exec(f1cmd).stdout;
 check("large result comes back grouped", /^fold: 30 hits in 1 files/.test(f1out) && /1-32 function big ×30 L2,/.test(f1out) && f1out.length < exec(big).stdout.length);
 check("repeat of a folded grep runs raw", sh(big, "f1") === null);
@@ -244,6 +266,19 @@ const lab = sh("grep -rn label lib", "f2")?.hookSpecificOutput?.updatedInput?.co
 check("unanswered symbol grep is folded", / fold --tag /.test(lab));
 check("a result folding would not shrink is unchanged", exec(lab).stdout === exec("grep -rn label lib").stdout && exec(lab).stdout.length > 500);
 check("a grep that was not folded is not a repeat", sh("grep -rn label lib", "f2")?.hookSpecificOutput?.updatedInput?.command === lab);
+// One file: `-H` lets the fold place each hit; a pass-through prints what grep alone would.
+const one = "grep -n 'needleWord[0-9]' src/big.ts | head -50";
+const onecmd = sh(one, "f4")?.hookSpecificOutput?.updatedInput?.command || "";
+check("one-file grep gets -H and --strip-path", /^grep -H -n 'needleWord\[0-9\]' src\/big\.ts \| '[^']+' fold --tag [0-9a-f]{12} --log '[^']+' --strip-path src\/big\.ts --head 50 \| head -50$/.test(onecmd));
+check("one-file grep comes back grouped", /^fold: 30 hits in 1 files/.test(exec(onecmd).stdout));
+// Capped by the tail: 8 raw lines are smaller than the fold's grouping would be after the cut.
+const capped = "grep -n 'needleWord[0-9]' src/big.ts | cut -c1-30 | head -8";
+const cappedcmd = sh(capped, "f8")?.hookSpecificOutput?.updatedInput?.command || "";
+check("capped grep names its limits", / --head 8 --cut 1-30 \| cut -c1-30 \| head -8$/.test(cappedcmd));
+check("capped grep below the pass size prints what grep prints", exec(cappedcmd).stdout === exec(capped).stdout);
+const small = "grep -n helper src/a.ts";
+const smallcmd = sh(small, "f7")?.hookSpecificOutput?.updatedInput?.command || "";
+check("small one-file grep prints exactly what grep prints", / --strip-path src\/a\.ts$/.test(smallcmd) && exec(smallcmd).stdout === exec(small).stdout);
 const none = sh("grep -rn nothingHere src && echo FOUND; echo AFTER", "f3")?.hookSpecificOutput?.updatedInput?.command || "";
 check("no match still fails the chain", exec(none).stdout === "AFTER\n");
 // A binary without `fold` would swallow the grep's output: such a grep is left alone.

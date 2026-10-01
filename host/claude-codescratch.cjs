@@ -423,7 +423,7 @@ const ERR_TAIL = /(?:\s+2>\s*\/dev\/null|\s+2>&1)+\s*$/;
 
 /** `s` with every quoted span and escaped character blanked, length kept: what is left is
  *  what the shell reads as syntax. null when a quote never closes. */
-function unquoted(s) {
+function unquoted(s, fill = " ") {
   let out = "";
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
@@ -435,13 +435,13 @@ function unquoted(s) {
       continue;
     }
     if (end < 0) return null;
-    out += " ".repeat(end - i);
+    out += fill.repeat(end - i);
     i = end - 1;
   }
   return out;
 }
 
-/** One segment → { head, tail } when it is `rg|grep ARGS [| head] [| cut -c]` printing matching
+/** One segment → { head, tail, file } when it is `rg|grep ARGS [| head] [| cut -c]` printing matching
  *  lines: `head | codescratch fold tail` then prints the same thing, or less. Deliberately loose
  *  about ARGS (variables, paths, globs stay the shell's business): `fold` passes through
  *  whatever does not arrive as `path:line:text`. Redirects, substitutions and any other reader
@@ -454,13 +454,31 @@ function foldable(t) {
   const args = u.slice(0, cut).replace(ERR_TAIL, "");
   const prog = /^(rg|grep|ugrep)\s/.exec(args);
   if (!prog || /[<>`()]/.test(args) || !FOLD_TAIL.test(t.slice(cut))) return null;
-  for (const w of args.split(/\s+/).slice(1)) {
-    if (w === "--") break;
-    if (FOLD_SKIP_LONG.test(w) || FOLD_SKIP_SHORT.test(w)) return null;
-    // rg's `-r` rewrites the match; grep's recurses.
-    if (prog[1] === "rg" && /^-[a-zA-Z]*r/.test(w)) return null;
+  // Quoted spans filled, not blanked, so a quoted pattern stays one word.
+  const words = [...unquoted(t, "x").slice(0, args.length).matchAll(/\S+/g)].slice(1);
+  let opts = true;
+  let recurse = false;
+  const positional = [];
+  for (const m of words) {
+    const w = t.slice(m.index, m.index + m[0].length);
+    if (opts && w === "--") {
+      opts = false;
+      continue;
+    }
+    if (opts && w.startsWith("-")) {
+      if (FOLD_SKIP_LONG.test(w) || FOLD_SKIP_SHORT.test(w)) return null;
+      // rg's `-r` rewrites the match; grep's recurses.
+      if (prog[1] === "rg" && /^-[a-zA-Z]*r/.test(w)) return null;
+      if (/^-[a-zA-Z]*[rRd]|^--(?:recursive|dereference-recursive|directories)\b/.test(w)) recurse = true;
+      continue;
+    }
+    positional.push(w);
   }
-  return { head: t.slice(0, cut).trimEnd(), tail: t.slice(cut) };
+  const head = t.slice(0, cut).trimEnd();
+  // grep with one file prints `line:text`, no path, so fold cannot place it: add `-H`, and fold
+  // drops the `FILE:` prefix again when it passes the lines through. `FILE` stays the shell's word.
+  const file = prog[1] !== "rg" && !recurse && positional.length === 2 && !/[*?[{]/.test(positional[1]) ? positional[1] : null;
+  return { head, tail: t.slice(cut), file };
 }
 
 /** Whether the installed binary has `fold`, asked once per session: piping a grep into a
@@ -472,6 +490,26 @@ function canFold(st) {
 
 function foldLog(session) {
   return statePath(session).replace(/\.json$/, ".fold.jsonl");
+}
+
+/** The tail's limits as `fold` flags, so fold sizes both answers as the reader will see them:
+ *  `| head [-n] [-]N` → `--head N` (10 by default, the smallest wins), `| cut -c LIST` →
+ *  `--cut LIST`. `head -n -N` (all but the last N) sets no limit. */
+function tailFlags(tail) {
+  let head = null;
+  let cut = null;
+  for (const seg of tail.split("|").map((x) => x.trim()).filter(Boolean)) {
+    const h = /^head(\s+-n)?(?:\s+(-?)(\d+))?$/.exec(seg);
+    if (h) {
+      if (h[1] && h[2]) continue;
+      const n = h[3] ? Number(h[3]) : 10;
+      head = head === null ? n : Math.min(head, n);
+      continue;
+    }
+    const c = /^cut\s+-c\s*([\d,-]+)$/.exec(seg);
+    if (c) cut = c[1];
+  }
+  return `${head === null ? "" : ` --head ${head}`}${cut === null ? "" : ` --cut ${cut}`}`;
 }
 
 /** Latest log line for `tag`: written by `codescratch fold`, or by this hook for a raw rerun. */
@@ -658,7 +696,9 @@ function serveRewrite(input, plan, aside = newAside()) {
     } catch {
       continue;
     }
-    texts[f.i] = texts[f.i].replace(texts[f.i].trim(), () => `${f.head} | ${shq(bin())} fold --tag ${tag} --log ${shq(log)}${f.tail && ` ${f.tail}`}`);
+    const head = f.file ? f.head.replace(/^(\S+)/, "$1 -H") : f.head;
+    const strip = f.file ? ` --strip-path ${f.file}` : "";
+    texts[f.i] = texts[f.i].replace(texts[f.i].trim(), () => `${head} | ${shq(bin())} fold --tag ${tag} --log ${shq(log)}${strip}${tailFlags(f.tail)}${f.tail && ` ${f.tail}`}`);
     metric({ decision: "rewrite", rule: "text-fold", repo, session: input.session_id });
     folded++;
   }
@@ -742,4 +782,4 @@ if (require.main === module) {
   process.exit(0);
 }
 
-module.exports = { fromBash, fromGrepTool, scopeOf, isSymbolIdent, symbolsOf, splitChain, planBash, foldable, decide };
+module.exports = { fromBash, fromGrepTool, scopeOf, isSymbolIdent, symbolsOf, splitChain, planBash, foldable, tailFlags, decide };

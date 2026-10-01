@@ -7,6 +7,7 @@ use crate::db;
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -227,6 +228,57 @@ pub fn fold(
     Ok((out, stats))
 }
 
+/// What reads on after `fold` in the caller's pipe: `| head -N` keeps the first N lines,
+/// `| cut -c LIST` keeps those characters of each line. Default: everything.
+#[derive(Default)]
+pub struct Tail {
+    pub head: Option<usize>,
+    /// 1-based inclusive ranges, as `cut -c` reads them.
+    pub cut: Option<Vec<(usize, usize)>>,
+}
+
+impl Tail {
+    /// `cut -c` LIST: `N`, `N-`, `-M`, `N-M`, comma-separated. None when it is not one.
+    pub fn parse_cut(list: &str) -> Option<Vec<(usize, usize)>> {
+        list.split(',')
+            .map(|r| {
+                let (a, b) = r.split_once('-').unwrap_or((r, r));
+                let a = if a.is_empty() { 1 } else { a.parse().ok()? };
+                let b = if b.is_empty() { usize::MAX } else { b.parse().ok()? };
+                (a >= 1 && a <= b).then_some((a, b))
+            })
+            .collect()
+    }
+
+    /// `text` as it leaves the tail.
+    pub fn view(&self, text: &str) -> String {
+        let lines = text.split_inclusive('\n').take(self.head.unwrap_or(usize::MAX));
+        let Some(cut) = &self.cut else {
+            return lines.collect();
+        };
+        lines
+            .map(|l| {
+                let (body, nl) = l.strip_suffix('\n').map_or((l, ""), |b| (b, "\n"));
+                let kept: String = body
+                    .chars()
+                    .enumerate()
+                    .filter(|(i, _)| cut.iter().any(|&(a, b)| a <= i + 1 && i + 1 <= b))
+                    .map(|(_, c)| c)
+                    .collect();
+                kept + nl
+            })
+            .collect()
+    }
+}
+
+/// `raw` with a leading `file:` taken off every line that has one, newlines kept.
+fn strip_prefix(raw: &str, file: &str) -> String {
+    let prefix = format!("{file}:");
+    raw.split_inclusive('\n')
+        .map(|l| l.strip_prefix(prefix.as_str()).unwrap_or(l))
+        .collect()
+}
+
 /// Symbol spans read straight from each repo's graph, one read-only connection per root.
 struct Graphs {
     cwd: PathBuf,
@@ -285,7 +337,12 @@ fn append_log(log: &Path, line: &LogLine) -> Result<()> {
 
 /// stdin → stdout. `false` when stdin was empty: the grep found nothing, and the caller exits 1
 /// so `grep X | codescratch fold && next` still behaves like `grep X && next`.
-pub fn run(log: Option<&Path>, tag: Option<&str>) -> Result<bool> {
+pub fn run(
+    log: Option<&Path>,
+    tag: Option<&str>,
+    strip_path: Option<&str>,
+    tail: &Tail,
+) -> Result<bool> {
     let mut stdin = std::io::stdin().lock();
     let mut bytes = Vec::new();
     stdin.by_ref().take(MAX_INPUT + 1).read_to_end(&mut bytes)?;
@@ -299,14 +356,33 @@ pub fn run(log: Option<&Path>, tag: Option<&str>) -> Result<bool> {
         conns: HashMap::new(),
     };
     let huge = bytes.len() as u64 > MAX_INPUT;
+    // What the grep would have printed without the caller's `-H`: the size to beat, and the
+    // bytes to pass through.
+    let plain = match strip_path {
+        Some(file) if !huge => Cow::Owned(strip_prefix(&raw, file)),
+        _ => Cow::Borrowed(raw.as_ref()),
+    };
+    // Sizes as the reader sees them: both answers still go through the caller's `| head` /
+    // `| cut -c`, so a capped grep is the size to beat, and the size the log records.
+    let shown = tail.view(&plain).len();
     let folded = if huge {
         Err("huge")
+    } else if shown <= PASS_BELOW {
+        Err("small")
     } else {
-        fold(&raw, &mut |p| graphs.spans(p))
+        fold(&raw, &mut |p| graphs.spans(p)).and_then(|(out, mut stats)| {
+            let out_shown = tail.view(&out).len();
+            if out_shown >= shown {
+                return Err("not-smaller");
+            }
+            stats.raw_chars = shown;
+            stats.out_chars = out_shown;
+            Ok((out, stats))
+        })
     };
     let passed = Stats {
-        raw_chars: raw.len(),
-        out_chars: raw.len(),
+        raw_chars: shown,
+        out_chars: shown,
         ..Stats::default()
     };
     if let Some(log) = log {
@@ -326,6 +402,7 @@ pub fn run(log: Option<&Path>, tag: Option<&str>) -> Result<bool> {
     let mut stdout = std::io::stdout().lock();
     let _ = stdout.write_all(match &folded {
         Ok((out, _)) => out.as_bytes(),
+        Err(_) if strip_path.is_some() && !huge => plain.as_bytes(),
         Err(_) => &bytes,
     });
     if huge {
@@ -382,6 +459,26 @@ mod tests {
         assert_eq!(enclosing(&spans, 15), Some(1));
         assert_eq!(enclosing(&spans, 40), Some(0));
         assert_eq!(enclosing(&spans, 60), None);
+    }
+
+    #[test]
+    fn tail_keeps_what_head_and_cut_keep() {
+        let tail = Tail {
+            head: Some(2),
+            cut: Tail::parse_cut("1-3,5"),
+        };
+        assert_eq!(tail.view("abcdef\nghijkl\nmno\n"), "abce\nghik\n");
+        assert_eq!(Tail::default().view("a\nb"), "a\nb");
+        assert_eq!(Tail::parse_cut("-150"), Some(vec![(1, 150)]));
+        assert_eq!(Tail::parse_cut("7-"), Some(vec![(7, usize::MAX)]));
+        assert_eq!(Tail::parse_cut("3-1"), None);
+        assert_eq!(Tail::parse_cut("x"), None);
+    }
+
+    #[test]
+    fn strip_prefix_drops_only_the_added_path() {
+        let raw = "src/a.ts:3:x\nsrc/a.ts:9:src/a.ts:y\nBinary file src/a.ts matches\n";
+        assert_eq!(strip_prefix(raw, "src/a.ts"), "3:x\n9:src/a.ts:y\nBinary file src/a.ts matches\n");
     }
 
     #[test]
