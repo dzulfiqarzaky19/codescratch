@@ -7,7 +7,7 @@
 //! `trust::render_group`) is one loop — a group honesty leak is one place to
 //! miss. One root renders exactly what it rendered before groups existed.
 
-use crate::query::Explored;
+use crate::query::{Detail, Explored};
 use crate::{changes, group, host, query, trust};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -68,23 +68,50 @@ impl Scope {
         })
     }
 
-    pub fn explore(&self, symbol: &str) -> Result<String> {
+    pub fn explore(&self, symbol: &str, detail: Detail) -> Result<String> {
         if !self.is_group() {
-            return query::explore(&self.roots[0], symbol);
+            return query::explore(&self.roots[0], symbol, detail);
         }
-        let mut hits = Vec::new();
+        let mut found = Vec::new();
         let mut misses = Vec::new();
+        // Brief only: word matches in the repos that do not declare the symbol.
+        let mut stray: Vec<String> = Vec::new();
         let (parts, _) = self.fold_group(|root, label, _t, _err| {
             match query::explore_one(root, symbol) {
-                Ok(Explored::Found(view)) => hits.push(format!(
-                    "# repo `{label}`\n\n{}",
-                    query::render_view(&view)
-                )),
-                Ok(Explored::Missing { .. }) => misses.push(label.to_string()),
+                Ok(Explored::Found(view)) => found.push((label.to_string(), view)),
+                Ok(Explored::Missing { .. }) => {
+                    if detail == Detail::Brief {
+                        stray.extend(
+                            query::text_mentions(root, symbol)
+                                .into_iter()
+                                .map(|m| format!("{label}/{m}")),
+                        );
+                    }
+                    misses.push(label.to_string())
+                }
                 Err(e) => misses.push(format!("{label} (error: {e})")),
             }
             Ok(None)
         })?;
+        // One repo's refusal is the group's: a partial answer must not read as a whole one.
+        let gap = (detail == Detail::Brief)
+            .then(|| {
+                found.iter().find_map(|(_, v)| v.grep_gap()).or_else(|| {
+                    (stray.len() > query::MAX_TEXT_ONLY)
+                        .then(|| format!("{} files in other repos mention it", stray.len()))
+                })
+            })
+            .flatten();
+        let hits: Vec<String> = found
+            .iter()
+            .map(|(label, view)| {
+                let payload = match &gap {
+                    Some(g) => query::render_refusal(view, g),
+                    None => query::render_view(view, detail),
+                };
+                format!("# repo `{label}`\n\n{payload}")
+            })
+            .collect();
         let mut body = String::new();
         if hits.is_empty() {
             body.push_str(&format!(
@@ -92,6 +119,12 @@ impl Scope {
             ));
         } else {
             body.push_str(&hits.join("\n---\n\n"));
+        }
+        if gap.is_none() && !hits.is_empty() && !stray.is_empty() {
+            body.push_str("\n**text-only mentions in repos without the symbol**\n");
+            for m in &stray {
+                body.push_str(&format!("- {m}\n"));
+            }
         }
         if !misses.is_empty() {
             body.push_str(&format!("\nnot found in: {}\n", misses.join(", ")));

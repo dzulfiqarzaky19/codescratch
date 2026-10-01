@@ -22,6 +22,7 @@ mod watch;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use query::Detail;
 use scope::Scope;
 use std::path::PathBuf;
 
@@ -76,6 +77,9 @@ enum Command {
         /// Explore across every repo in this group.
         #[arg(long)]
         group: Option<String>,
+        /// Definition, signature and direct callers only — no source body.
+        #[arg(long)]
+        brief: bool,
     },
     /// Fuzzy find a symbol by name.
     Search {
@@ -168,10 +172,12 @@ fn main() -> Result<()> {
             path_pos,
             path,
             group,
+            brief,
         } => {
+            let detail = if brief { Detail::Brief } else { Detail::Full };
             println!(
                 "{}",
-                scope_of(group, pick_path(path_pos, path))?.explore(&symbol)?
+                scope_of(group, pick_path(path_pos, path))?.explore(&symbol, detail)?
             );
         }
         Command::Search {

@@ -2,7 +2,7 @@
 //!
 //! Explore payload v2 (frozen section order):
 //!   banner → node+snippet → call-path spine → members/heritage
-//!   → depth-grouped blast → routes/processes
+//!   → depth-grouped blast → uses → routes/processes
 //! Weak edges stay labeled. Absence ≠ proof.
 //! Markdown is an adapter over [`ExploreView`].
 
@@ -15,6 +15,25 @@ use std::collections::HashSet;
 use std::path::Path;
 
 const SNIPPET_BUDGET: usize = 1600;
+/// Direct callers (and, separately, uses) a brief answer lists before it counts the rest.
+const BRIEF_CALLERS: usize = 40;
+/// Same-name symbols a brief answer covers; past this the name is too common to stand in for a grep.
+const MAX_SAME_NAME: usize = 6;
+/// Files a brief answer may list as text-only mentions; past this the name is a word, not a symbol.
+pub(crate) const MAX_TEXT_ONLY: usize = 12;
+
+/// How much of an [`ExploreView`] the markdown adapter prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Detail {
+    /// The fat payload: source, spine, members, full blast, callees, routes.
+    #[default]
+    Full,
+    /// What a grep for the name would have told you: where it is defined, its
+    /// signature, its direct callers and its uses, for every symbol of that name,
+    /// then the files that only mention it as text. No source body. Prints the `## ` header
+    /// only when the graph can stand in for that grep (see [`ExploreView::grep_gap`]).
+    Brief,
+}
 
 fn node_by_id(conn: &Connection, id: &str) -> Option<NodeRow> {
     NodeRow::by_id(conn, id)
@@ -77,6 +96,42 @@ pub struct ExploreView {
     pub blast: Vec<(usize, Vec<String>)>,
     pub callees: Vec<String>,
     pub routes: Vec<String>,
+    /// Inbound `references` edges: JSX elements, type annotations, value reads.
+    pub uses: Vec<String>,
+    /// Nodes carrying this name, the explored one included.
+    pub same_name: usize,
+    /// The other nodes of that name, up to [`MAX_SAME_NAME`] in all.
+    pub others: Vec<ExploreView>,
+    /// `file:line` of the first word match in each indexed file that no node,
+    /// caller or use of this name lives in: strings, comments, fields, bare imports.
+    pub text_only: Vec<String>,
+}
+
+impl ExploreView {
+    /// Why this view cannot replace a text search for the name, or `None` when it
+    /// can: few enough nodes carry the name, and few enough files mention it
+    /// outside the graph that the answer can list them all.
+    pub fn grep_gap(&self) -> Option<String> {
+        if self.same_name > MAX_SAME_NAME {
+            return Some(format!("{} symbols share this name", self.same_name));
+        }
+        if self.text_only.len() > MAX_TEXT_ONLY {
+            return Some(format!(
+                "{} files mention it outside the graph",
+                self.text_only.len()
+            ));
+        }
+        None
+    }
+
+    fn direct_callers(&self) -> &[String] {
+        self.blast
+            .iter()
+            .find(|(depth, _)| *depth == 1)
+            .map(|(_, rows)| rows.as_slice())
+            .unwrap_or(&[])
+    }
+
 }
 
 /// One repo's answer to an explore. The **variant** carries found-vs-missing;
@@ -86,10 +141,10 @@ pub enum Explored {
     Missing { suggestions: Vec<String> },
 }
 
-pub fn explore(root: &Path, symbol: &str) -> Result<String> {
+pub fn explore(root: &Path, symbol: &str, detail: Detail) -> Result<String> {
     let banner = trust::banner(&trust::of(root)?);
     match explore_one(root, symbol)? {
-        Explored::Found(view) => Ok(format!("{banner}\n\n{}", render_view(&view))),
+        Explored::Found(view) => Ok(format!("{banner}\n\n{}", render_view(&view, detail))),
         Explored::Missing { suggestions } => {
             let mut out = format!(
                 "{banner}\n\nno symbol named `{symbol}`. try `search {symbol}` for fuzzy matches."
@@ -130,7 +185,26 @@ pub fn explore_one(root: &Path, symbol: &str) -> Result<Explored> {
         return Ok(Explored::Missing { suggestions });
     };
 
-    Ok(Explored::Found(gather(&conn, root, n)))
+    let mut view = gather(&conn, root, n);
+    if view.same_name > 1 && view.same_name <= MAX_SAME_NAME {
+        view.others = same_name_nodes(&conn, &view.node)
+            .into_iter()
+            .map(|o| gather(&conn, root, o))
+            .collect();
+    }
+    view.text_only = text_only_mentions(&conn, root, &view.node.name);
+    Ok(Explored::Found(view))
+}
+
+fn same_name_nodes(conn: &Connection, n: &NodeRow) -> Vec<NodeRow> {
+    let sql = "SELECT id,kind,name,qualified_name,file_path,start_line,end_line,exported,signature
+               FROM nodes WHERE name=?1 AND id<>?2 ORDER BY exported DESC, file_path, start_line";
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return vec![];
+    };
+    stmt.query_map([&n.name, &n.id], NodeRow::from_row)
+        .map(|it| it.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
 }
 
 /// Spine, members, heritage, blast, callees, routes, snippet for one node.
@@ -145,26 +219,50 @@ fn gather(conn: &Connection, root: &Path, n: NodeRow) -> ExploreView {
         blast: blast_by_depth(conn, &n.id, blast::MAX_DEPTH),
         callees: edges_out(conn, &n.id, "calls"),
         routes: routes_touching(conn, &n.id),
+        uses: uses_in(conn, &n.id),
+        others: vec![],
+        text_only: vec![],
+        same_name: conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE name=?1", [&n.name], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|c| c as usize)
+            .unwrap_or(1),
         node: n,
     }
 }
 
 /// Markdown adapter over [`ExploreView`]. Frozen section order is here, not in
 /// the gather path, so tests can assert on the view without grepping prose.
-pub(crate) fn render_view(v: &ExploreView) -> String {
+pub(crate) fn render_view(v: &ExploreView, detail: Detail) -> String {
     let n = &v.node;
     let mut out = String::new();
-    out.push_str(&format!(
-        "## {} `{}`  ({}:{}-{}){}\n",
-        n.kind,
-        n.qualified_name,
-        n.file_path,
-        n.start_line,
-        n.end_line,
-        if n.exported { "  [exported]" } else { "" }
-    ));
-    if !n.signature.is_empty() {
-        out.push_str(&format!("`{}`\n", n.signature));
+    if detail == Detail::Brief {
+        if let Some(gap) = v.grep_gap() {
+            return render_refusal(v, &gap);
+        }
+    }
+    render_header(v, &mut out);
+    if detail == Detail::Brief {
+        render_brief_users(v, &mut out);
+        for o in &v.others {
+            out.push('\n');
+            render_header(o, &mut out);
+            render_brief_users(o, &mut out);
+        }
+        if !v.text_only.is_empty() {
+            out.push_str("\n**text-only mentions** (string, comment, field or bare import)\n");
+            for m in &v.text_only {
+                out.push_str(&format!("- {m}\n"));
+            }
+        } else {
+            out.push_str("\nno other file mentions this name.\n");
+        }
+        out.push_str(&format!(
+            "\n(brief — `codescratch explore {}` for transitive callers, source and callees)\n",
+            n.name
+        ));
+        return out;
     }
     if let Some(code) = &v.snippet {
         out.push_str("\n```\n");
@@ -208,6 +306,13 @@ pub(crate) fn render_view(v: &ExploreView) -> String {
         }
     }
 
+    if !v.uses.is_empty() {
+        out.push_str("\n**uses ←**\n");
+        for u in &v.uses {
+            out.push_str(&format!("- {u}\n"));
+        }
+    }
+
     out.push_str("\n**calls →**\n");
     if v.callees.is_empty() {
         out.push_str("- (none captured)\n");
@@ -225,6 +330,63 @@ pub(crate) fn render_view(v: &ExploreView) -> String {
         }
     }
     out
+}
+
+/// Brief's "grep instead": where the symbol is and why the graph cannot stand in.
+/// No `## ` header: hosts read that header as "the graph answered the grep".
+pub(crate) fn render_refusal(v: &ExploreView, gap: &str) -> String {
+    let n = &v.node;
+    format!(
+        "{} `{}`  ({}:{}-{}){}\nnot a grep substitute: {gap}. grep `{}` for its uses.\n",
+        n.kind,
+        n.qualified_name,
+        n.file_path,
+        n.start_line,
+        n.end_line,
+        if n.exported { "  [exported]" } else { "" },
+        n.name
+    )
+}
+
+fn render_header(v: &ExploreView, out: &mut String) {
+    let n = &v.node;
+    out.push_str(&format!(
+        "## {} `{}`  ({}:{}-{}){}\n",
+        n.kind,
+        n.qualified_name,
+        n.file_path,
+        n.start_line,
+        n.end_line,
+        if n.exported { "  [exported]" } else { "" }
+    ));
+    if !n.signature.is_empty() {
+        out.push_str(&format!("`{}`\n", n.signature));
+    }
+}
+
+/// Brief body: direct callers and uses, each capped, deeper hops as a count.
+fn render_brief_users(v: &ExploreView, out: &mut String) {
+    let deeper: usize = v
+        .blast
+        .iter()
+        .filter(|(depth, _)| *depth > 1)
+        .map(|(_, rows)| rows.len())
+        .sum();
+    for (title, rows) in [("callers", v.direct_callers()), ("uses", v.uses.as_slice())] {
+        if rows.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n**{title} ←**\n"));
+        for r in rows.iter().take(BRIEF_CALLERS) {
+            out.push_str(&format!("- {r}\n"));
+        }
+        if rows.len() > BRIEF_CALLERS {
+            out.push_str(&format!("- … {} more\n", rows.len() - BRIEF_CALLERS));
+        }
+    }
+    if deeper > 0 {
+        out.push_str(&format!("({deeper} transitive callers)\n"));
+    }
 }
 
 fn child_symbols(conn: &Connection, id: &str) -> Vec<NodeRow> {
@@ -372,6 +534,93 @@ fn blast_by_depth(conn: &Connection, id: &str, max: usize) -> Vec<(usize, Vec<St
     buckets
 }
 
+fn uses_in(conn: &Connection, id: &str) -> Vec<String> {
+    let sql = "SELECT n.qualified_name, e.file_path, e.line, e.reason
+               FROM edges e LEFT JOIN nodes n ON n.id = e.src_id
+               WHERE e.dst_id=?1 AND e.kind='references'
+               ORDER BY e.file_path, e.line";
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return vec![];
+    };
+    stmt.query_map([id], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })
+    .map(|it| {
+        it.filter_map(|r| r.ok())
+            .map(|(who, file, line, reason)| {
+                let who = who.unwrap_or_else(|| "<module>".to_string());
+                format!("{who}  {file}:{line}  [{reason}]")
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// [`text_only_mentions`] for a repo taken on its own: every word match, when the
+/// repo declares no symbol of that name.
+pub(crate) fn text_mentions(root: &Path, name: &str) -> Vec<String> {
+    db::open(root)
+        .map(|conn| text_only_mentions(&conn, root, name))
+        .unwrap_or_default()
+}
+
+/// Indexed files where `name` appears as a whole word but no node of that name is
+/// declared, called or used. Read from disk, so it is as fresh as a grep.
+fn text_only_mentions(conn: &Connection, root: &Path, name: &str) -> Vec<String> {
+    let column = |sql: &str, arg: Option<&str>| -> Vec<String> {
+        let Ok(mut stmt) = conn.prepare(sql) else {
+            return vec![];
+        };
+        stmt.query_map(rusqlite::params_from_iter(arg), |r| r.get::<_, String>(0))
+            .map(|it| it.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    };
+    let linked: HashSet<String> = column(
+        "SELECT file_path FROM nodes WHERE name=?1
+         UNION
+         SELECT e.file_path FROM edges e JOIN nodes n ON n.id = e.dst_id
+         WHERE n.name=?1 AND e.kind IN ('calls','references') AND e.resolved=1",
+        Some(name),
+    )
+    .into_iter()
+    .collect();
+    let mut out = Vec::new();
+    for path in column("SELECT path FROM files ORDER BY path", None) {
+        if linked.contains(&path) {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(root.join(&path)) else {
+            continue;
+        };
+        let hits: Vec<usize> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| has_word(l, name))
+            .map(|(i, _)| i + 1)
+            .collect();
+        match hits.as_slice() {
+            [] => {}
+            [one] => out.push(format!("{path}:{one}")),
+            [first, rest @ ..] => out.push(format!("{path}:{first}  (+{} lines)", rest.len())),
+        }
+    }
+    out
+}
+
+/// `word` occurs in `line` with no identifier character on either side.
+fn has_word(line: &str, word: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    line.match_indices(word).any(|(i, _)| {
+        !line[..i].chars().next_back().is_some_and(ident)
+            && !line[i + word.len()..].chars().next().is_some_and(ident)
+    })
+}
+
 fn routes_touching(conn: &Connection, id: &str) -> Vec<String> {
     let sql = "SELECT n.qualified_name, n.file_path, n.start_line, e.kind
                FROM edges e JOIN nodes n ON n.id = e.dst_id
@@ -442,12 +691,16 @@ mod tests {
             blast: vec![(1, vec!["bar  src/b.ts:2  [same-file]".into()])],
             callees: vec![],
             routes: vec!["step_in  flow:bar  src/b.ts:0".into()],
+            uses: vec![],
+            others: vec![],
+            text_only: vec![],
+            same_name: 1,
         }
     }
 
     #[test]
     fn render_view_keeps_frozen_section_order() {
-        let s = render_view(&view_fixture());
+        let s = render_view(&view_fixture(), Detail::Full);
         let spine = s.find("**call-path spine**").unwrap();
         let blast = s.find("**callers ← (blast radius)**").unwrap();
         let calls = s.find("**calls →**").unwrap();
@@ -456,6 +709,76 @@ mod tests {
         assert!(s.contains("[exported]"));
         assert!(s.contains("depth 1:"));
         assert!(s.contains("step_in"));
+    }
+
+    #[test]
+    fn brief_keeps_location_and_direct_callers_only() {
+        let mut v = view_fixture();
+        v.blast.push((2, vec!["baz  src/c.ts:9  [import]".into()]));
+        let s = render_view(&v, Detail::Brief);
+        assert!(s.starts_with("## function `foo`  (src/a.ts:1-3)  [exported]"), "{s}");
+        assert!(s.contains("`function foo()`"));
+        assert!(s.contains("- bar  src/b.ts:2  [same-file]"));
+        assert!(s.contains("(1 transitive callers)"), "{s}");
+        for gone in ["return 1", "baz", "**call-path spine**", "**calls →**", "**routes / processes**"] {
+            assert!(!s.contains(gone), "brief leaked `{gone}`:\n{s}");
+        }
+    }
+
+    #[test]
+    fn brief_answers_any_kind_the_graph_holds_a_use_of() {
+        let mut ty = view_fixture();
+        ty.node.kind = "type".into();
+        ty.blast.clear();
+        ty.uses = vec!["Row  src/c.ts:4  [import-binding]".into()];
+        let s = render_view(&ty, Detail::Brief);
+        assert!(s.starts_with("## type `foo`"), "{s}");
+        assert!(s.contains("**uses ←**\n- Row  src/c.ts:4  [import-binding]"), "{s}");
+        assert!(!s.contains("**callers ←**"), "{s}");
+    }
+
+    #[test]
+    fn brief_accounts_for_every_file_a_grep_would_list() {
+        let mut v = view_fixture();
+        assert!(render_view(&v, Detail::Brief).contains("no other file mentions this name."));
+        v.text_only = vec!["src/doc.ts:7  (+2 lines)".into()];
+        let s = render_view(&v, Detail::Brief);
+        assert!(s.contains("**text-only mentions**") && s.contains("- src/doc.ts:7  (+2 lines)"), "{s}");
+        assert!(!render_view(&v, Detail::Full).contains("text-only"), "full payload is unchanged");
+    }
+
+    #[test]
+    fn has_word_respects_identifier_boundaries() {
+        assert!(has_word("const a = foo(1)", "foo") && has_word("'foo'", "foo") && has_word("x.foo", "foo"));
+        assert!(!has_word("foobar()", "foo") && !has_word("my_foo", "foo") && !has_word("$foo", "foo"));
+        assert!(has_word("foobar foo", "foo"), "a later whole-word match still counts");
+    }
+
+    #[test]
+    fn brief_lists_every_symbol_of_a_shared_name() {
+        let mut v = view_fixture();
+        let mut twin = view_fixture();
+        twin.node.file_path = "src/z.ts".into();
+        twin.blast.clear();
+        v.same_name = 2;
+        v.others = vec![twin];
+        let s = render_view(&v, Detail::Brief);
+        assert!(s.contains("(src/a.ts:1-3)") && s.contains("## function `foo`  (src/z.ts:1-3)"), "{s}");
+        assert_eq!(s.matches("(brief — ").count(), 1, "{s}");
+    }
+
+    #[test]
+    fn brief_drops_the_header_when_the_graph_cannot_replace_a_grep() {
+        let mut common = view_fixture();
+        common.same_name = MAX_SAME_NAME + 1;
+        let mut wordy = view_fixture();
+        wordy.text_only = (0..=MAX_TEXT_ONLY).map(|i| format!("src/f{i}.ts:1")).collect();
+        for (v, why) in [(common, "7 symbols share"), (wordy, "13 files mention it outside the graph")] {
+            let s = render_view(&v, Detail::Brief);
+            assert!(!s.contains("## "), "{s}");
+            assert!(s.contains("src/a.ts:1-3") && s.contains(why), "{s}");
+            assert!(render_view(&v, Detail::Full).starts_with("## "), "full keeps the header");
+        }
     }
 
     #[test]

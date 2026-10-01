@@ -2,7 +2,7 @@
 //! Recursive node walk (kind/field API is stable across tree-sitter versions);
 //! avoids the version-fragile Query API on purpose.
 
-use crate::model::{Edge, FileFacts, Lang, RawCall, Symbol};
+use crate::model::{Edge, FileFacts, Lang, RawCall, RawRef, Symbol};
 use tree_sitter::{Node, Parser};
 
 mod ast;
@@ -43,6 +43,17 @@ pub fn extract(path_rel: &str, src: &str) -> FileFacts {
                 visit(tree.root_node(), &mut ctx);
             }
         }
+        // Locals and globals can never resolve: drop them before they reach the resolver.
+        let known: std::collections::HashSet<&str> = facts
+            .symbols
+            .iter()
+            .map(|s| s.name.as_str())
+            .chain(facts.imports.iter().map(|b| b.local_name.as_str()))
+            .collect();
+        let mut refs = std::mem::take(&mut facts.refs);
+        refs.retain(|r| known.contains(r.name.as_str()));
+        refs.dedup_by(|b, a| a.from_id == b.from_id && a.name == b.name && a.line == b.line);
+        facts.refs = refs;
     }
     enrich(&mut facts, path_rel, src);
     facts
@@ -65,10 +76,21 @@ fn signature(n: Node, bytes: &[u8]) -> String {
     let full = ast::text(n, bytes);
     let cut = full.find(['{', '\n']).unwrap_or(full.len());
     let mut s = full[..cut].trim().to_string();
-    if s.len() > 200 {
-        s.truncate(200);
-    }
+    truncate_on_char_boundary(&mut s, 200);
     s
+}
+
+/// `String::truncate` panics when the cut lands inside a multi-byte char, so
+/// snap back to the nearest char boundary at or below `max`.
+fn truncate_on_char_boundary(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
 }
 
 fn visit(node: Node, ctx: &mut Ctx) {
@@ -145,9 +167,18 @@ fn visit(node: Node, ctx: &mut Ctx) {
                     "type_alias_declaration" => "type",
                     _ => "enum",
                 };
-                push_symbol(ctx, node, name, kind, None);
+                let id = push_symbol(ctx, node, name, kind, None);
+                if kind != "enum" {
+                    // The types a declaration mentions are its own references.
+                    ast::recurse_with(node, ctx, Some(id), ctx.class.clone(), visit);
+                    return;
+                }
             }
             // fall through: enum initializers may contain calls
+        }
+        "identifier" | "type_identifier" | "shorthand_property_identifier" => {
+            record_ref(node, ctx);
+            return;
         }
         "call_expression" => {
             record_call(node, ctx);
@@ -216,6 +247,42 @@ fn record_call(node: Node, ctx: &mut Ctx) {
         from_id,
         name,
         member,
+        line: node.start_position().row + 1,
+        file_path: ctx.file.to_string(),
+    });
+}
+
+/// A use of a name that is neither its declaration nor a call's callee (calls have
+/// their own edge). Every identifier lands here; `extract` keeps the ones naming
+/// an import or a symbol of this file.
+fn record_ref(node: Node, ctx: &mut Ctx) {
+    if let Some(p) = node.parent() {
+        let named_here = p.child_by_field_name("name").map(|n| n.id()) == Some(node.id());
+        let jsx = matches!(p.kind(), "jsx_opening_element" | "jsx_self_closing_element");
+        if (named_here && !jsx) || p.kind() == "jsx_closing_element" {
+            return;
+        }
+        if p.kind() == "call_expression"
+            && p.child_by_field_name("function").map(|n| n.id()) == Some(node.id())
+        {
+            return;
+        }
+        if matches!(p.kind(), "required_parameter" | "optional_parameter" | "arrow_function")
+            && p.child_by_field_name("pattern")
+                .or_else(|| p.child_by_field_name("parameter"))
+                .map(|n| n.id())
+                == Some(node.id())
+        {
+            return;
+        }
+    }
+    let from_id = ctx
+        .enclosing
+        .clone()
+        .unwrap_or_else(|| Symbol::module_id(ctx.file));
+    ctx.facts.refs.push(RawRef {
+        from_id,
+        name: ast::text(node, ctx.bytes).to_string(),
         line: node.start_position().row + 1,
         file_path: ctx.file.to_string(),
     });
@@ -411,6 +478,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn truncation_lands_on_a_char_boundary() {
+        let mut s = "a".to_string() + &"é".repeat(150); // 301 bytes
+        truncate_on_char_boundary(&mut s, 200);
+        assert!(s.len() <= 200, "len {} over budget", s.len());
+        assert!(s.is_char_boundary(s.len()), "cut mid-char");
+        assert_eq!(s.chars().count(), 100);
+    }
+
+    #[test]
     fn extracts_symbols_calls_imports() {
         let src = r#"
 import { helper } from "./util";
@@ -486,6 +562,33 @@ class Box {
         assert!(has("MAX", "const", true));
         assert!(has("local", "const", false));
         assert!(!f.symbols.iter().any(|s| s.name == "x"));
+    }
+
+    #[test]
+    fn references_are_uses_not_declarations_or_callees() {
+        let src = r#"
+import { Card, helper, type Row } from "./ui";
+const LIMIT = 3;
+type Page = { rows: Row[] };
+export function View(props: Page, helper: number) {
+  const local = LIMIT;
+  run(helper);
+  helper();
+  return <Card items={[local]} {...{ LIMIT }}></Card>;
+}
+"#;
+        let f = extract("src/a.tsx", src);
+        let at = |name: &str| -> Vec<usize> {
+            f.refs.iter().filter(|r| r.name == name).map(|r| r.line).collect()
+        };
+        assert_eq!(at("Card"), vec![9], "JSX opening tag only");
+        assert_eq!(at("Row"), vec![4]);
+        assert_eq!(at("LIMIT"), vec![6, 9], "read + shorthand, not the declaration");
+        assert_eq!(at("Page"), vec![5]);
+        assert_eq!(at("helper"), vec![7], "argument yes; parameter and callee no");
+        assert!(at("local").is_empty() && at("props").is_empty(), "locals are dropped");
+        let row = f.refs.iter().find(|r| r.name == "Row").unwrap();
+        assert!(row.from_id.contains("#Page@"), "a type owns the types it mentions: {}", row.from_id);
     }
 
     #[test]

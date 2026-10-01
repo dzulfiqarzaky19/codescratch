@@ -13,7 +13,7 @@
 //! Specifier → file (relative, tsconfig paths, workspace packages) lives in this
 //! same module: it is how `import-binding` is decided, not a second behaviour.
 
-use crate::model::{Edge, ImportBinding, RawCall, Symbol};
+use crate::model::{Edge, ImportBinding, RawCall, RawRef, Symbol};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -48,18 +48,7 @@ pub fn resolve_with_heritage(
     // Call sites never target a type: `const User` + `type User` must stay unique.
     let (call_global, call_per_file) =
         symbol_maps(symbols.iter().filter(|s| !is_type_only(&s.kind)));
-    let mut binds: HashMap<&str, HashMap<&str, &ImportBinding>> = HashMap::new();
-    let mut binds_by_file: HashMap<&str, Vec<&ImportBinding>> = HashMap::new();
-    for b in bindings {
-        binds
-            .entry(b.file_path.as_str())
-            .or_default()
-            .insert(b.local_name.as_str(), b);
-        binds_by_file
-            .entry(b.file_path.as_str())
-            .or_default()
-            .push(b);
-    }
+    let (binds, binds_by_file) = bind_maps(bindings);
 
     let mut edges: Vec<Edge> = Vec::new();
 
@@ -259,6 +248,86 @@ pub fn resolve_with_heritage(
     edges
 }
 
+/// `references` edges. Only the two strong reasons apply: the name is an import
+/// binding of the file, or a declaration in it. Anything else is a local or a
+/// global, and yields no edge rather than a guess.
+pub fn resolve_refs(
+    symbols: &[Symbol],
+    refs: &[RawRef],
+    bindings: &[ImportBinding],
+    files: &HashSet<String>,
+    cfg: &ResolveConfig,
+) -> Vec<Edge> {
+    let (_, per_file) = symbol_maps(symbols.iter());
+    let (binds, binds_by_file) = bind_maps(bindings);
+
+    let mut seen: HashSet<(&str, &str, usize)> = HashSet::new();
+    let mut edges = Vec::new();
+    for r in refs {
+        let imported = binds
+            .get(r.file_path.as_str())
+            .and_then(|m| m.get(r.name.as_str()))
+            .and_then(|b| {
+                let target = resolve_module(&r.file_path, &b.source_module, files, cfg)?;
+                let want = if b.imported_name == "default" {
+                    "default"
+                } else {
+                    b.imported_name.as_str()
+                };
+                resolve_export(&per_file, &binds_by_file, files, cfg, &target, want, 0)
+            })
+            .map(|s| (s, "import-binding"));
+        let local = || {
+            per_file
+                .get(r.file_path.as_str())
+                .and_then(|m| m.get(r.name.as_str()))
+                .and_then(|c| c.iter().find(|s| s.kind != "method"))
+                .map(|s| (*s, "same-file"))
+        };
+        let Some((dst, reason)) = imported.or_else(local) else {
+            continue;
+        };
+        if dst.id == r.from_id || !seen.insert((r.from_id.as_str(), dst.id.as_str(), r.line)) {
+            continue;
+        }
+        edges.push(Edge {
+            src_id: r.from_id.clone(),
+            dst_id: Some(dst.id.clone()),
+            kind: "references".into(),
+            raw_name: r.name.clone(),
+            resolved: true,
+            conf: "strong".into(),
+            reason: reason.into(),
+            provenance: "ast".into(),
+            file_path: r.file_path.clone(),
+            line: r.line,
+        });
+    }
+    edges
+}
+
+type BindMaps<'a> = (
+    HashMap<&'a str, HashMap<&'a str, &'a ImportBinding>>,
+    HashMap<&'a str, Vec<&'a ImportBinding>>,
+);
+
+/// `(file → local name → binding, file → bindings)`.
+fn bind_maps(bindings: &[ImportBinding]) -> BindMaps<'_> {
+    let mut binds: HashMap<&str, HashMap<&str, &ImportBinding>> = HashMap::new();
+    let mut binds_by_file: HashMap<&str, Vec<&ImportBinding>> = HashMap::new();
+    for b in bindings {
+        binds
+            .entry(b.file_path.as_str())
+            .or_default()
+            .insert(b.local_name.as_str(), b);
+        binds_by_file
+            .entry(b.file_path.as_str())
+            .or_default()
+            .push(b);
+    }
+    (binds, binds_by_file)
+}
+
 type SymbolMaps<'a> = (
     HashMap<&'a str, Vec<&'a Symbol>>,
     HashMap<&'a str, HashMap<&'a str, Vec<&'a Symbol>>>,
@@ -327,6 +396,25 @@ fn resolve_export<'a>(
                     cfg,
                     &target,
                     want,
+                    depth + 1,
+                ) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    // `import { X } from "./a"; export { X };` — the module hands on what it imported.
+    for b in binds {
+        if matches!(b.kind.as_str(), "named" | "default") && b.local_name == imported_name {
+            if let Some(target) = resolve_module(module_file, &b.source_module, files, cfg)
+            {
+                if let Some(s) = resolve_export(
+                    per_file,
+                    binds_by_file,
+                    files,
+                    cfg,
+                    &target,
+                    b.imported_name.as_str(),
                     depth + 1,
                 ) {
                     return Some(s);
@@ -601,21 +689,51 @@ fn load_tsconfig(root: &Path, rel: &str, cfg: &mut ResolveConfig, depth: usize) 
     }
 }
 
+/// JSONC → JSON: drop `//` and `/* */` comments and trailing commas, leaving string
+/// contents alone (`"@/*": ["./*"]` and `"**/*.ts"` are not comments).
 fn strip_jsonc(raw: &str) -> String {
-    let mut s = raw.to_string();
-    while let Some(i) = s.find("/*") {
-        match s[i + 2..].find("*/") {
-            Some(j) => s.replace_range(i..i + 2 + j + 2, " "),
-            None => break,
+    let b = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(b.len());
+                out.extend_from_slice(&b[start..i]);
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                out.push(b' ');
+            }
+            c @ (b'}' | b']') => {
+                let last = out.iter().rposition(|x| !x.is_ascii_whitespace());
+                if let Some(k) = last.filter(|&k| out[k] == b',') {
+                    out[k] = b' ';
+                }
+                out.push(c);
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
         }
     }
-    s.lines()
-        .map(|l| match l.find("//") {
-            Some(i) => &l[..i],
-            None => l,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[derive(Deserialize, Default)]
@@ -791,6 +909,47 @@ mod tests {
     }
 
     #[test]
+    fn references_resolve_by_import_or_same_file_only() {
+        let symbols = vec![
+            sym("ui.ts#Card@1", "Card", "ui.ts", "function", true),
+            sym("ui.ts#Row@9", "Row", "ui.ts", "type", true),
+            sym("a.ts#LIMIT@2", "LIMIT", "a.ts", "const", false),
+            sym("a.ts#View@4", "View", "a.ts", "function", true),
+            sym("z.ts#Lonely@1", "Lonely", "z.ts", "function", true),
+        ];
+        let bind = |local: &str| ImportBinding {
+            file_path: "a.ts".into(),
+            local_name: local.into(),
+            source_module: "./ui".into(),
+            imported_name: local.into(),
+            kind: "named".into(),
+        };
+        let r = |name: &str, line: usize| RawRef {
+            from_id: "a.ts#View@4".into(),
+            name: name.into(),
+            line,
+            file_path: "a.ts".into(),
+        };
+        let refs = vec![r("Card", 5), r("Card", 5), r("Row", 6), r("LIMIT", 7), r("Lonely", 8), r("View", 9)];
+        let files: HashSet<String> = ["a.ts", "ui.ts", "z.ts"].iter().map(|s| s.to_string()).collect();
+        let edges = resolve_refs(&symbols, &refs, &[bind("Card"), bind("Row")], &files, &ResolveConfig::default());
+        let got: Vec<(&str, &str)> = edges
+            .iter()
+            .map(|e| (e.dst_id.as_deref().unwrap(), e.reason.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("ui.ts#Card@1", "import-binding"),
+                ("ui.ts#Row@9", "import-binding"),
+                ("a.ts#LIMIT@2", "same-file"),
+            ],
+            "duplicates collapse; an unimported global and a self-reference yield nothing"
+        );
+        assert!(edges.iter().all(|e| e.kind == "references" && e.resolved && e.conf == "strong"));
+    }
+
+    #[test]
     fn receiver_unknown_is_weak() {
         let syms = vec![
             sym("a.ts#save@1", "save", "a.ts", "method", false),
@@ -851,6 +1010,22 @@ mod tests {
             resolve_relative("src/a.ts", "./lib/math.js", &files).as_deref(),
             Some("src/lib/math.ts")
         );
+    }
+
+    #[test]
+    fn jsonc_strip_leaves_glob_strings_alone() {
+        let raw = r#"{
+  /* Projects */
+  "compilerOptions": {
+    "paths": { "@/*": ["./*"], "*": ["./types/*"], }, // aliases
+    "docs": "https://aka.ms/tsconfig",
+  },
+  "include": ["**/*.ts", ".next/types/**/*.ts"],
+}"#;
+        let ts: Tsconfig = serde_json::from_str(&strip_jsonc(raw)).expect("valid JSON after strip");
+        let paths = ts.compiler_options.unwrap().paths.unwrap();
+        assert_eq!(paths["@/*"], vec!["./*"]);
+        assert_eq!(paths["*"], vec!["./types/*"]);
     }
 
     #[test]
@@ -918,6 +1093,38 @@ mod tests {
         assert_eq!(e.reason, "import-binding");
         assert_eq!(e.conf, "strong");
         assert_eq!(e.dst_id.as_deref(), Some("src/lib/math.ts#add@1"));
+    }
+
+    #[test]
+    fn import_then_export_hands_the_symbol_on() {
+        // lib.ts declares; types.ts does `import { Mode } from "./lib"; export { Mode };`
+        let symbols = vec![
+            sym("lib.ts#Mode@1", "Mode", "lib.ts", "type", true),
+            sym("a.ts#use@3", "use", "a.ts", "function", true),
+        ];
+        let bind = |file: &str, from: &str| ImportBinding {
+            file_path: file.into(),
+            local_name: "Mode".into(),
+            source_module: from.into(),
+            imported_name: "Mode".into(),
+            kind: "named".into(),
+        };
+        let refs = vec![RawRef {
+            from_id: "a.ts#use@3".into(),
+            name: "Mode".into(),
+            line: 4,
+            file_path: "a.ts".into(),
+        }];
+        let files: HashSet<String> = ["a.ts", "types.ts", "lib.ts"].iter().map(|s| s.to_string()).collect();
+        let edges = resolve_refs(
+            &symbols,
+            &refs,
+            &[bind("a.ts", "./types"), bind("types.ts", "./lib")],
+            &files,
+            &ResolveConfig::default(),
+        );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].dst_id.as_deref(), Some("lib.ts#Mode@1"));
     }
 
     #[test]

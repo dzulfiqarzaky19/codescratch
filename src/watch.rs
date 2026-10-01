@@ -67,6 +67,38 @@ fn owning_root<'a>(roots: &'a [PathBuf], abs: &Path) -> Option<(&'a PathBuf, Str
     })
 }
 
+/// Watch `dir` recursively, descending past subdirectories the kernel refuses
+/// to watch instead of aborting the session. notify's recursive watch bails on
+/// the first `EACCES` it meets (a root-owned `pgdata/` under a repo, say) and
+/// returns `Err` for the whole call, so on that error we retry each child on
+/// its own. A dir even we cannot `read_dir` is warned about and skipped.
+fn watch_tree(watcher: &mut RecommendedWatcher, dir: &Path) -> Result<()> {
+    match watcher.watch(dir, RecursiveMode::Recursive) {
+        Ok(()) => Ok(()),
+        Err(e) if is_permission_denied(&e) => {
+            match std::fs::read_dir(dir) {
+                Ok(children) => {
+                    for child in children.flatten() {
+                        let is_dir = child.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                        if is_dir {
+                            watch_tree(watcher, &child.path())?;
+                        }
+                    }
+                }
+                // Readable? inotify would have taken it. Unreadable dirs are
+                // the ones we truly skip, so warn about those only.
+                Err(_) => eprintln!("skipping unwatchable {}: {e}", dir.display()),
+            }
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to watch {}", dir.display())),
+    }
+}
+
+fn is_permission_denied(e: &notify::Error) -> bool {
+    matches!(&e.kind, notify::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
 /// Watch every repo in `scope` recursively and keep each graph fresh via
 /// debounced `host::ensure` calls. Pending edits are tracked per repo, so a
 /// burst in one repo never triggers an `ensure` in a quiet sibling. Runs until
@@ -83,9 +115,7 @@ pub fn run(scope: &Scope) -> Result<()> {
     let ignores: Vec<Gitignore> = roots.iter().map(|r| gitignore_of(r)).collect();
 
     for root in roots {
-        watcher
-            .watch(root, RecursiveMode::Recursive)
-            .with_context(|| format!("failed to watch {}", root.display()))?;
+        watch_tree(&mut watcher, root)?;
         eprintln!("watching {} for changes (ctrl-c to stop)", root.display());
     }
 
@@ -150,6 +180,16 @@ pub fn run(scope: &Scope) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_denied_is_detected() {
+        let denied = notify::Error::io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        ));
+        assert!(is_permission_denied(&denied));
+        let missing = notify::Error::io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!is_permission_denied(&missing));
+    }
 
     #[test]
     fn no_flush_when_nothing_pending() {

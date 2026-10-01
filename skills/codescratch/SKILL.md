@@ -5,11 +5,12 @@ description: TS/JS structure graph. Prefer over grep/rg for where a symbol is de
 
 Graph lives in `<repo>/.codescratch/graph.db`. Host keeps it fresh (`ensure` / `watch`). Do not reindex every turn.
 
-In Claude Code a bare-identifier grep inside a codescratch repo is answered from the graph: a lone grep is denied and the reason carries the `explore` answer; inside a batch (`;` `&&` `||`) that segment prints the answer instead and the rest runs. Use it. Repeat the same grep once only if you need raw text matches. A grep scoped to one file always runs.
+In Claude Code a grep for symbol names (`Foo`, `Foo(`, `export const Foo`, `Foo\|Bar`) inside a codescratch repo is answered from the graph when it can account for every file that mentions them: a lone grep is denied and the reason carries the `explore` answer; inside a batch (`;` `&&` `||`) that segment prints the answer instead and the rest runs. Use it. Repeat the same grep once only if you need raw text matches. A grep scoped to one file always runs.
 
 ```
 codescratch status                         # trust × coverage × resolve
 codescratch explore <Symbol>               # snippet + calls + callers (blast)
+codescratch explore <Symbol> --brief       # where defined + signature + callers + uses + text-only mentions, no source
 codescratch search <name>                  # fuzzy find
 codescratch changes                        # git diff → symbols + blast
 codescratch ensure                         # catch-up if banner says trust: stale
@@ -22,5 +23,6 @@ Read the banner on every answer. Three axes, do not mix them:
 - `coverage:` how much was walked (`exhaustive` / `sampled`).
 - `resolve:` in-repo bind rate (`ok` / `partial`). Weak / unbound calls. Not freshness.
 `conf=weak` on an edge is a name guess. Auth/money/deletes: read source anyway. Graph misses `import()`, DI, proxies.
+`uses ←` lists non-call references (JSX elements, type annotations, values passed or read), resolved by import or same file only.
 
 Never `reindex` unless trust is stuck. `rg`/`grep` for a single identifier (`Foo`) is a miss — `explore Foo` first. Strings, regex, `TODO`, path filters: grep is fine.

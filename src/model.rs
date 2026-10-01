@@ -82,6 +82,16 @@ pub struct RawCall {
     pub file_path: String,
 }
 
+/// An identifier use that is not a call: a JSX element, a type annotation, a value
+/// read or passed. Becomes a `references` edge when it resolves; dropped otherwise.
+#[derive(Debug, Clone)]
+pub struct RawRef {
+    pub from_id: String, // enclosing symbol id, or Symbol::module_id
+    pub name: String,
+    pub line: usize,
+    pub file_path: String,
+}
+
 /// One import binding row — the substrate for `import-binding` resolution.
 #[derive(Debug, Clone)]
 pub struct ImportBinding {
@@ -98,6 +108,7 @@ pub struct ImportBinding {
 pub struct FileFacts {
     pub symbols: Vec<Symbol>,
     pub calls: Vec<RawCall>,
+    pub refs: Vec<RawRef>,
     pub imports: Vec<ImportBinding>,
     pub heritage: Vec<Edge>,
     pub extra: Vec<Edge>,
@@ -110,7 +121,7 @@ pub struct FileFacts {
 pub struct Edge {
     pub src_id: String,
     pub dst_id: Option<String>,
-    pub kind: String, // calls | imports | contains | extends
+    pub kind: String, // calls | references | imports | contains | extends
     pub raw_name: String,
     pub resolved: bool,
     pub conf: String,       // strong | weak

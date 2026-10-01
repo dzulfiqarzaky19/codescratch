@@ -20,6 +20,7 @@ Needs a C compiler on PATH (`cc`/`gcc`) for bundled SQLite + tree-sitter grammar
 codescratch init                 # build the graph under ./.codescratch/
 codescratch status               # trust banner
 codescratch explore <Symbol>     # banner + source + calls + callers (blast)
+codescratch explore <Symbol> --brief   # where defined + signature + callers + uses + text-only mentions, no source
 codescratch search <name>        # FTS fuzzy find
 codescratch ensure               # bring graph up to date (host-owned, single-flight)
 codescratch setup                # global skill + Pi host; strips leftover MCP

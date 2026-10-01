@@ -23,6 +23,7 @@ pub fn index_all(conn: &mut Connection, root: &Path) -> Result<()> {
 
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut calls = Vec::new();
+    let mut refs = Vec::new();
     let mut bindings = Vec::new();
     let mut files_set: HashSet<String> = HashSet::new();
     for s in &scanned {
@@ -31,6 +32,7 @@ pub fn index_all(conn: &mut Connection, root: &Path) -> Result<()> {
     for s in &scanned {
         symbols.extend(s.facts.symbols.iter().cloned());
         calls.extend(s.facts.calls.iter().cloned());
+        refs.extend(s.facts.refs.iter().cloned());
         bindings.extend(s.facts.imports.iter().cloned());
     }
 
@@ -60,6 +62,7 @@ pub fn index_all(conn: &mut Connection, root: &Path) -> Result<()> {
             }
         }
     }
+    edges.extend(resolve::resolve_refs(&symbols, &refs, &bindings, &files_set, &cfg));
     edges.extend(extra);
 
     let now = now_ms();
